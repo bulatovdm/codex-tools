@@ -1,0 +1,4 @@
+{
+  "fields": ["project", "environment", "address", "listener", "scope", "browser"],
+  "separator": " · "
+}
