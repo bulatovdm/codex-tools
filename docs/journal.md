@@ -32,3 +32,20 @@
   escapes удаляются, предшествующая переписка из snapshot в вывод не переносится.
   Все21 tests green, обновлён один установленный скрипт с backup; реальный
   сохранённый failure теперь объясняет35 против36 символов без запуска модели.
+
+- По прямому разрешению пользователя из work-worker реализован opted-in empty cx
+  startup. Red actual run metadata args=[], green фиксированный positional service
+  prompt; prompts/resume/unknown args нетронуты, query bounded/fail-closed. Отдельный
+  red filesystem resolve error → green fallback обычного запуска.
+- Live обнаружил подмену WORK_WORKER_HOME tmux shell: первый service turn успешно
+  WW_SESSION_READY, но private QA runtime не выбран. Новые red explicit var/absence
+  regressions → green terminal environment restore в launch.py. Первая собственная
+  QA registration осталась закрытой в unconnected scope основного runtime без mail;
+  не объявляется успешной isolation. Повторная native QA01a13fca… зарегистрирована
+  в isolated runtime/open автоматически без manual prompt, затем active controller
+  получил WW_CX_AUTOSTART_MAIL_OK; accepted/read/done с обеих сторон. Unknown controller
+  negative probe корректно failed, outcome не переписывали. Никаких dev tasks peer.
+- Полный28 tests на /usr/bin/python3 (3.9) green. Установлены main+launch только,
+  private backups и baseline checks; hooks/trust/shell/LaunchAgent не менялись.
+  QA native /quit, exact own broker остановлен после disconnect, temp scripts удалены.
+  Новый пустой cx в connected/enabled проекте подхватывает feature без MCP reload.

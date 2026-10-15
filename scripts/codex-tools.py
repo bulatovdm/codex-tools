@@ -11,6 +11,65 @@ import re
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
+WORK_WORKER_STARTUP_PROMPT = (
+    "Work Worker automatic startup initialization. This is a service turn, not a development task. "
+    "Let the trusted native hooks initialize this new session. Do not use tools, run commands, "
+    "edit files or settings, send mail, or start further tasks. Reply only WW_SESSION_READY."
+)
+
+
+def startup_arguments(arguments, cwd):
+    try:
+        return _startup_arguments(arguments, cwd)
+    except (OSError, RuntimeError):
+        return arguments
+
+
+def _startup_arguments(arguments, cwd):
+    # Recognize only empty native launches whose argument meaning is known. All
+    # prompts, subcommands, config/profile overrides and future flags pass through.
+    selected = pathlib.Path(cwd).resolve()
+    valued = {'-C', '--cd', '-m', '--model', '-s', '--sandbox', '-a', '--ask-for-approval', '--add-dir'}
+    flags = {'--no-alt-screen', '--oss', '--search', '--strict-config', '--approve-for-me'}
+    index = 0
+    while index < len(arguments):
+        arg = arguments[index]
+        if arg in valued:
+            if index + 1 >= len(arguments) or arguments[index + 1].startswith('-'):
+                return arguments
+            if arg in {'-C', '--cd'}:
+                selected = (pathlib.Path(cwd) / arguments[index + 1]).resolve()
+            index += 2
+        elif any(arg.startswith(option + '=') for option in valued if option.startswith('--')):
+            option, value = arg.split('=', 1)
+            if not value:
+                return arguments
+            if option == '--cd':
+                selected = (pathlib.Path(cwd) / value).resolve()
+            index += 1
+        elif arg in flags:
+            index += 1
+        else:
+            return arguments
+    executable = shutil.which('work-worker')
+    if not executable:
+        return arguments
+    try:
+        result = subprocess.run([executable, 'startup-context'], cwd=str(selected),
+                                capture_output=True, text=True, timeout=1.5)
+        if result.returncode != 0 or len(result.stdout) > 4096:
+            return arguments
+        context = json.loads(result.stdout)
+        if not isinstance(context, dict) or context.get('version') != 1 or context.get('enabled') is not True:
+            return arguments
+        root = pathlib.Path(context['project_root'])
+        if not root.is_absolute() or not selected.is_relative_to(root.resolve()):
+            return arguments
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        return arguments
+    return [*arguments, '--', WORK_WORKER_STARTUP_PROMPT]
+
+
 def tmux_path():
     installed = pathlib.Path.home() / '.local/share/codex-tools/tmux/bin/tmux'
     return str(installed) if installed.exists() else shutil.which('tmux')
@@ -53,7 +112,8 @@ def run(arguments):
     cli = pathlib.Path.home() / '.local/bin/codex'
     if not cli.exists():
         raise RuntimeError('Codex CLI is missing: ' + str(cli))
-    environment = {key: value for key, value in os.environ.items() if key in ['EMPIRIKA_BASE_URL', 'EMPIRIKA_EVENT_PROJECT', 'EMPIRIKA_EVENT_ASSET', 'EMPIRIKA_LISTENERS_DIR']}
+    environment = {key: value for key, value in os.environ.items() if key in ['EMPIRIKA_BASE_URL', 'EMPIRIKA_EVENT_PROJECT', 'EMPIRIKA_EVENT_ASSET', 'EMPIRIKA_LISTENERS_DIR', 'WORK_WORKER_HOME']}
+    arguments = startup_arguments(arguments, os.getcwd())
     launch = {'cwd': os.getcwd(), 'args': arguments, 'cli': str(cli), 'environment': environment}
     descriptor = os.open(directory / 'launch.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, 'w') as output:

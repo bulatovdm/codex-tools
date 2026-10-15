@@ -16,6 +16,8 @@ while not (directory / 'ready').exists():
         sys.exit('codex-tools: terminal setup did not finish')
     time.sleep(0.05)
 os.environ['CODEX_TOOLS_RUN'] = directory.name
+# The tmux shell may source ~/.zshenv; restore the terminal's exact runtime choice.
+os.environ.pop('WORK_WORKER_HOME', None)
 os.environ.update(launch['environment'])
 guard = pathlib.Path.home() / '.local/bin/codex-browser-guard'
 if guard.exists():

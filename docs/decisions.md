@@ -15,3 +15,22 @@
 ## 004 — Сторож проверяет совместимость перед исправлением
 
 Принято 14.10.2026. CLI выбирается стабильным путём `~/.local/bin/codex`; проверяются новые версии бинарника, конфиги восстанавливаются после обновления плагина. Отключение sandbox и закрепление старой версии отвергнуты. Перезапуск общего сервера отвергнут: он прерывает работу других сессий.
+
+## 005 — Автоинициализация нового cx только по Work Worker opt-in
+
+Реализовано2026-10-15 по прямому разрешению пользователя, полученному в work-worker
+после предложения изменить эту обвязку. Новый пустой native запуск запрашивает
+scoped readonly work-worker startup-context (timeout1.5s). Только version1/enabled=true
+и соответствующий selected directory допускают фиксированный startup prompt с
+ответом WW_SESSION_READY. Query не передаёт инструкции, команду/prompt из его JSON
+не принимаем. Native trusted hooks дают ID; журнал/identity launcher не выдумывает.
+Пользовательский prompt, resume/fork/picker, config/profile overrides, remote/worktree
+и unknown CLI args сохраняются. Missing/invalid/timeout query — обычный запуск.
+Есть один короткий service turn, не zero-cost hook; global hook не ускоряет native
+SessionStart. Другие проекты не opt-in автоматически.
+Live выявил замену WORK_WORKER_HOME вложенным shell из zshenv. Переменная включена
+в существующий whitelist private launch metadata; launch.py восстанавливает и value,
+и отсутствие после tmux shell. Другие env keys/родной --no-daemon режим сохранены.
+Установлены только2 scripts с private backup, hooks/trust/shell/LaunchAgent не тронуты.
+TDD/28 Python tests и реальная empty cx→trusted hook→open participant→mail read/reply/
+processed выполнены; QA проект/broker изолированы после исправления и штатно закрыты.
