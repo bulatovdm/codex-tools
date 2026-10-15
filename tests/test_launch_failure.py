@@ -44,4 +44,32 @@ class LaunchFailureTests(unittest.TestCase):
             self.assertEqual(exited.exception.code,7)
             log=run/'terminal-error.log';self.assertEqual(log.read_text(),'Error: fixture startup failure\n');self.assertEqual(log.stat().st_mode&0o777,0o600)
             args=command.call_args.args[0];self.assertIn('capture-pane',args);self.assertEqual(args[-2:],['-t','%42'])
+    def simulate_failure(self, text, code=1):
+        spec=importlib.util.spec_from_file_location('friendly_launcher',ROOT/'scripts/codex-tools.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as d:
+            home=Path(d);(home/'.local/bin').mkdir(parents=True);(home/'.local/bin/codex').touch()
+            def attach(args):
+                run=next((home/'.local/share/codex-tools/runs').iterdir())
+                (run/'exit-code').write_text(str(code));(run/'terminal-error.log').write_text(text)
+                return 0
+            output=Terminal()
+            with patch.object(Path,'home',return_value=home),patch.object(module,'tmux_path',return_value='/fixture/tmux'),patch.object(sys,'stdin',Terminal()),contextlib.redirect_stdout(output),patch.object(module.subprocess,'run'),patch.object(module.subprocess,'call',side_effect=attach):
+                self.assertEqual(module.run(['resume','fixture']),code)
+            return output.getvalue()
+
+    def test_failed_resume_explains_incomplete_uuid_and_offers_picker(self):
+        bad_id='01a13bc1-3679-7623-b654-46217682d3e'
+        output=self.simulate_failure('ERROR: No saved session found with ID '+bad_id+'. Run `codex resume` without an ID to choose from existing sessions.')
+        self.assertIn('не найдена',output)
+        self.assertIn(bad_id,output)
+        self.assertIn('35',output);self.assertIn('36',output)
+        self.assertIn('cx resume',output)
+
+    def test_other_cli_error_is_shown_without_terminal_escapes_or_conversation(self):
+        output=self.simulate_failure('private conversation must not print\n\x1b[31mERROR:\x1b[0m unexpected argument --fixture-bad\n')
+        self.assertIn('unexpected argument --fixture-bad',output)
+        self.assertNotIn('\x1b',output)
+        self.assertNotIn('private conversation',output)
+
 if __name__=='__main__':unittest.main()
