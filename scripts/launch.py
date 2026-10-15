@@ -3,6 +3,8 @@ import json
 import os
 import pathlib
 import subprocess
+import shutil
+import re
 import sys
 import time
 
@@ -23,5 +25,21 @@ try:
 except OSError as error:
     print(error, file=sys.stderr)
     result = 1
+if result != 0:
+    pane = os.environ.get('TMUX_PANE', '')
+    if os.environ.get('TMUX') and re.fullmatch(r'%[0-9]+', pane):
+        installed = pathlib.Path.home() / '.local/share/codex-tools/tmux/bin/tmux'
+        tmux = str(installed) if installed.exists() else shutil.which('tmux')
+        if tmux:
+            try:
+                captured = subprocess.run([tmux, 'capture-pane', '-p', '-S', '-200', '-t', pane],
+                                          capture_output=True, text=True, timeout=3)
+                if captured.returncode == 0:
+                    descriptor = os.open(directory / 'terminal-error.log',
+                                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(descriptor, 'w') as output:
+                        output.write(captured.stdout)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 (directory / 'exit-code').write_text(str(result))
 sys.exit(result)

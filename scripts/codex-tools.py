@@ -43,7 +43,10 @@ def run(arguments):
     attached = subprocess.call([*prefix, 'attach-session', '-t', 'codex'])
     if (directory / 'exit-code').exists():
         result = int((directory / 'exit-code').read_text())
-        shutil.rmtree(directory)
+        if result == 0:
+            shutil.rmtree(directory)
+        else:
+            print('Codex exited with code ' + str(result) + '; diagnostics: ' + str(directory))
         return result
     print('Detached; return with: ' + shlex.join([tmux, '-L', socket, 'attach']))
     return attached
