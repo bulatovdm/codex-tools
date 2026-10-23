@@ -1,0 +1,34 @@
+[mcp_servers]
+
+[mcp_servers.work_worker]
+command = "work-worker"
+args = ["mcp", "--session-source", "codex-tools"]
+env_vars = ["CODEX_TOOLS_RUN", "WORK_WORKER_HOME"]
+enabled = true
+startup_timeout_sec = 30
+
+[mcp_servers.work_worker.tools]
+
+[mcp_servers.work_worker.tools.ww_participants]
+approval_mode = "approve"
+
+[mcp_servers.work_worker.tools.ww_send]
+approval_mode = "approve"
+
+[mcp_servers.work_worker.tools.ww_inbox]
+approval_mode = "approve"
+
+[mcp_servers.work_worker.tools.ww_mark_read]
+approval_mode = "approve"
+
+[mcp_servers.work_worker.tools.ww_reply]
+approval_mode = "approve"
+
+[mcp_servers.work_worker.tools.ww_ack_processed]
+approval_mode = "approve"
+
+[mcp_servers.work_worker.tools.ww_delivery]
+approval_mode = "approve"
+
+[mcp_servers.work_worker.tools.ww_history]
+approval_mode = "approve"

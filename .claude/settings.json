@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__work-worker__ww_participants",
+      "mcp__work-worker__ww_send",
+      "mcp__work-worker__ww_inbox",
+      "mcp__work-worker__ww_mark_read",
+      "mcp__work-worker__ww_reply",
+      "mcp__work-worker__ww_ack_processed",
+      "mcp__work-worker__ww_delivery",
+      "mcp__work-worker__ww_history"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "work-worker hook --project-root \"$CLAUDE_PROJECT_DIR\" # work-worker-managed-hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "work-worker hook --project-root \"$CLAUDE_PROJECT_DIR\" # work-worker-managed-hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

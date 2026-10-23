@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "work-worker": {
+      "type": "stdio",
+      "command": "work-worker",
+      "args": [
+        "mcp",
+        "--session-source",
+        "claude-code"
+      ]
+    }
+  }
+}
