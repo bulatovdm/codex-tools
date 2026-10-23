@@ -91,7 +91,8 @@ class PhoneTests(unittest.TestCase):
         self.prompt()
         self.deliver(self.stop())
         for text in ['Work Worker inbox pointer (external data): {}', '<task-notification>done',
-                     'Work Worker automatic startup initialization.', 'Message Type: MESSAGE hi']:
+                     'Work Worker automatic startup initialization.', 'Work Worker startup signal (external service data).',
+                     'Message Type: MESSAGE hi']:
             self.prompt(text)
             self.deliver(self.stop())
         self.assertEqual(len(self.requests()), 1)
@@ -164,8 +165,7 @@ class PhoneTests(unittest.TestCase):
         self.assertIn('--max-time', requests[0])
 
     def test_question_and_permission_hooks_are_advisory_and_detached(self):
-        for kind, tool, body in [('PermissionRequest', 'Bash', phone.PERMISSION),
-                                 ('PreToolUse', 'request_user_input', phone.QUESTION),
+        for kind, tool, body in [('PreToolUse', 'request_user_input', phone.QUESTION),
                                  ('PreToolUse', 'mcp__x__request_user_input_async', phone.QUESTION)]:
             with patch.object(phone, 'project_name', return_value='project'), patch.object(phone.subprocess, 'Popen') as spawn:
                 phone.handle(self.event(kind, tool_name=tool, tool_input={'command': 'PRIVATE'}), phone.load_config())
@@ -173,6 +173,106 @@ class PhoneTests(unittest.TestCase):
                 self.assertEqual(args[-1], body)
                 self.assertNotIn('PRIVATE', ' '.join(args))
                 self.assertTrue(spawn.call_args[1]['start_new_session'])
+
+    def permission(self, command='PRIVATE COMMAND', turn='turn-1'):
+        return self.event('PermissionRequest', turn_id=turn, tool_name='Bash',
+                          tool_input={'command': command})
+
+    def input_worker(self, call):
+        phone.input_worker(*call.args, phone.load_config())
+
+    def test_permission_waits_and_resolved_auto_approval_never_notifies(self):
+        with patch.object(phone, 'launch_input_worker') as launch:
+            phone.handle(self.permission(), phone.load_config())
+        self.assertEqual(self.requests(), [])
+        phone.handle(self.event('PostToolUse', tool_name='Bash', tool_use_id='call-1',
+                               tool_input={'command': 'PRIVATE COMMAND'}), phone.load_config())
+        self.input_worker(launch.call_args)
+        self.assertEqual(self.requests(), [])
+
+    def test_automatic_reviewer_does_not_launch_any_permission_notification(self):
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {
+                'approval_policy': 'on-request', 'approvals_reviewer': 'auto_review'}}) + '\n')
+        with patch.object(phone, 'launch_input_worker') as launch, patch.object(phone.subprocess, 'Popen') as spawn:
+            for number in range(20):
+                phone.handle(self.permission(command='command-' + str(number)), phone.load_config())
+        launch.assert_not_called()
+        spawn.assert_not_called()
+        self.assertEqual(self.read_state().get('input_pending', {}), {})
+
+    def test_latest_approval_context_controls_routing_and_worker_rechecks_it(self):
+        with patch.object(phone, 'launch_input_worker') as launch:
+            phone.handle(self.permission(), phone.load_config())
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {
+                'approvals_reviewer': 'auto_review'}}) + '\n')
+        self.input_worker(launch.call_args)
+        self.assertEqual(self.requests(), [])
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {
+                'approvals_reviewer': 'user', 'approval_policy': 'on-request'}}) + '\n')
+        self.assertFalse(phone.automatic_approval(str(self.transcript)))
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {
+                'approvals_reviewer': 'user', 'approval_policy': 'never'}}) + '\n')
+        self.assertTrue(phone.automatic_approval(str(self.transcript)))
+
+    def test_same_permission_event_delivers_only_once_and_new_request_can_notify(self):
+        self.config.write_text('NTFY_TOPIC=t\nINPUT_NOTIFY_SECONDS=0\n')
+        with patch.object(phone, 'launch_input_worker') as launch:
+            for _ in range(4):
+                phone.handle(self.permission(), phone.load_config())
+            self.assertEqual(launch.call_count, 1)
+            self.input_worker(launch.call_args)
+            self.input_worker(launch.call_args)
+            phone.handle(self.permission(), phone.load_config())
+            self.assertEqual(launch.call_count, 1)
+            phone.handle(self.permission(command='DIFFERENT PRIVATE COMMAND'), phone.load_config())
+            self.assertEqual(launch.call_count, 2)
+            self.input_worker(launch.call_args)
+        self.assertEqual(len(self.requests()), 2)
+        self.assertNotIn('PRIVATE COMMAND', self.log.read_text())
+        self.assertNotIn('PRIVATE COMMAND', (phone.state_directory('test-session') / 'state.json').read_text())
+
+    def test_permission_cancels_on_stop_interrupt_or_human_reply(self):
+        for kind in ['Stop', 'Interrupt', 'SessionEnd', 'UserPromptSubmit']:
+            with self.subTest(kind=kind), patch.object(phone, 'launch_input_worker') as launch:
+                phone.handle(self.permission(turn=kind), phone.load_config())
+                phone.handle(self.event(kind, prompt='human reply'), phone.load_config())
+                self.input_worker(launch.call_args)
+        self.assertEqual(self.requests(), [])
+
+    def test_permission_delay_is_observed(self):
+        self.config.write_text('NTFY_TOPIC=t\nINPUT_NOTIFY_SECONDS=30\n')
+        with patch.object(phone, 'launch_input_worker') as launch:
+            phone.handle(self.permission(), phone.load_config())
+        now = time.time()
+        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone, 'send') as send, patch.object(phone.time, 'time', side_effect=[now, now + 31]), patch.object(phone.time, 'sleep') as sleep:
+            self.input_worker(launch.call_args)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(send.call_args[0][-1], phone.PERMISSION)
+
+    def test_duplicate_question_hook_only_notifies_once_per_call(self):
+        event = self.event('PreToolUse', turn_id='turn-1', tool_name='request_user_input',
+                           tool_use_id='question-1', tool_input={'questions': ['PRIVATE']})
+        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone.subprocess, 'Popen') as spawn:
+            phone.handle(event, phone.load_config())
+            phone.handle(event, phone.load_config())
+            self.assertEqual(spawn.call_count, 1)
+            event['tool_use_id'] = 'question-2'
+            phone.handle(event, phone.load_config())
+            self.assertEqual(spawn.call_count, 2)
+
+    def test_replayed_human_prompt_with_same_turn_does_not_reset_notification(self):
+        self.prompt(turn_id='human-turn')
+        self.deliver(self.stop())
+        self.prompt(turn_id='human-turn')
+        self.deliver(self.stop())
+        self.assertEqual(len(self.requests()), 1)
+        self.prompt(turn_id='another-human-turn')
+        self.deliver(self.stop())
+        self.assertEqual(len(self.requests()), 2)
 
     def test_actual_detached_stop_hook_returns_promptly_and_worker_delivers(self):
         self.prompt()
