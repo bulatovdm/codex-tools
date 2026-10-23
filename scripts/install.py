@@ -6,6 +6,7 @@ import pathlib
 import plistlib
 import shutil
 import subprocess
+import secrets
 
 def install_files(home, source):
     target = home / '.local/share/codex-tools'
@@ -60,7 +61,19 @@ alias cx='"$HOME/.local/bin/codex-tools" run'
         groups = hooks.setdefault('hooks', {}).setdefault(event, [])
         if not any(handler.get('command') == command for group in groups for handler in group.get('hooks', [])):
             groups.append({'hooks': [{'type': 'command', 'command': command, 'timeout': 3}]})
+    phone_command = '/usr/bin/python3 "$HOME/.local/share/codex-tools/scripts/notify-phone.py"'
+    for event in ['SessionStart', 'UserPromptSubmit', 'Stop', 'PermissionRequest',
+                  'PreToolUse', 'PostToolUse', 'Interrupt', 'SessionEnd']:
+        groups = hooks.setdefault('hooks', {}).setdefault(event, [])
+        if not any(handler.get('command') == phone_command for group in groups for handler in group.get('hooks', [])):
+            groups.append({'hooks': [{'type': 'command', 'command': phone_command, 'timeout': 3}]})
     write(hooks_path, (json.dumps(hooks, ensure_ascii=False, indent=2) + '\n').encode())
+    # Reuse Claude's delivery config rather than create another phone subscription.
+    notify = home / '.codex/notify.env'
+    if not notify.exists() and not (home / '.claude/notify.env').exists():
+        write(notify, ('# Subscribe to this topic in the ntfy phone app.\n'
+                       'NTFY_TOPIC=codex-' + secrets.token_hex(16) + '\n'
+                       'IDLE_NOTIFY_SECONDS=30\nBACKGROUND_WAIT_LIMIT_SECONDS=900\n').encode())
     options = home / '.config/codex-tools/status.json'
     if not options.exists():
         write(options, (source / 'examples/status.json').read_bytes())
