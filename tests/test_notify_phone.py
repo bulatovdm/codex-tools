@@ -68,7 +68,7 @@ class PhoneTests(unittest.TestCase):
         self.deliver(self.stop())
         self.assertEqual(len(self.requests()), 1)
         payload = json.loads(self.requests()[0][-2])
-        self.assertEqual(payload['title'], 'Codex · original-project')
+        self.assertTrue(payload['title'].startswith('Codex · original-project ['))
         self.assertEqual(payload['message'], phone.WAITING)
         self.assertNotIn('PRIVATE MODEL TEXT', self.log.read_text())
         self.prompt('Next task')
@@ -170,7 +170,7 @@ class PhoneTests(unittest.TestCase):
             with patch.object(phone, 'project_name', return_value='project'), patch.object(phone.subprocess, 'Popen') as spawn:
                 phone.handle(self.event(kind, tool_name=tool, tool_input={'command': 'PRIVATE'}), phone.load_config())
                 args = spawn.call_args[0][0]
-                self.assertEqual(args[-1], body)
+                self.assertEqual(self.read_state()['deliveries'][args[-1]]['body'], body)
                 self.assertNotIn('PRIVATE', ' '.join(args))
                 self.assertTrue(spawn.call_args[1]['start_new_session'])
 
@@ -248,7 +248,7 @@ class PhoneTests(unittest.TestCase):
         with patch.object(phone, 'launch_input_worker') as launch:
             phone.handle(self.permission(), phone.load_config())
         now = time.time()
-        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone, 'send') as send, patch.object(phone.time, 'time', side_effect=[now, now + 31]), patch.object(phone.time, 'sleep') as sleep:
+        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone, 'send', return_value={'ntfy'}) as send, patch.object(phone.time, 'time', side_effect=[now, now + 31, now + 31]), patch.object(phone.time, 'sleep') as sleep:
             self.input_worker(launch.call_args)
         self.assertEqual(sleep.call_count, 1)
         self.assertEqual(send.call_args[0][-1], phone.PERMISSION)
@@ -306,7 +306,7 @@ class PhoneTests(unittest.TestCase):
         def finish_task(delay):
             self.assertGreater(delay, 0)
             phone.handle(self.event('PostToolUse', tool_use_id='job'), phone.load_config())
-        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone, 'send') as send, patch.object(phone.time, 'time', side_effect=[now, now + 1]), patch.object(phone.time, 'sleep', side_effect=finish_task) as sleep:
+        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone, 'send', return_value={'ntfy'}) as send, patch.object(phone.time, 'time', side_effect=[now, now + 1, now + 1]), patch.object(phone.time, 'sleep', side_effect=finish_task) as sleep:
             self.deliver(token)
         self.assertEqual(sleep.call_count, 1)
         self.assertEqual(send.call_args[0][-1], phone.WAITING)
@@ -346,6 +346,166 @@ class PhoneTests(unittest.TestCase):
         self.prompt('new turn')
         self.deliver(self.stop())
         self.assertEqual(json.loads(self.requests()[-1][-2])['message'], phone.WAITING)
+
+    def test_approval_context_survives_large_output_and_tracks_new_context(self):
+        state = {}
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {'approvals_reviewer': 'auto_review'}}) + '\n')
+        self.assertTrue(phone.automatic_approval(str(self.transcript), state))
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type': 'response_item', 'payload': {'output': 'x' * 2_100_000}}) + '\n')
+        self.assertTrue(phone.automatic_approval(str(self.transcript), state))
+        self.assertTrue(phone.automatic_approval(str(self.transcript)))
+        with self.transcript.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {'approvals_reviewer': 'user', 'approval_policy': 'on-request'}}) + '\n')
+        self.assertFalse(phone.automatic_approval(str(self.transcript), state))
+        self.assertNotIn('output', json.dumps(state))
+        self.transcript.write_text('{"type":"turn_context","payload":{"approvals_reviewer":"auto_review"}}\n')
+        self.assertTrue(phone.automatic_approval(str(self.transcript), state))
+
+    def test_async_question_and_stop_produce_only_one_waiting_notification(self):
+        self.config.write_text('NTFY_TOPIC=t\nINPUT_NOTIFY_SECONDS=0\nIDLE_NOTIFY_SECONDS=0\n')
+        self.prompt()
+        event = self.event('PreToolUse', tool_name='request_user_input_async', tool_use_id='q1', turn_id='turn')
+        with patch.object(phone, 'launch_delivery_worker') as launch:
+            phone.handle(event, phone.load_config())
+        phone.delivery_worker(*launch.call_args.args, phone.load_config())
+        phone.handle(self.event('PostToolUse', tool_name='request_user_input_async', tool_use_id='q1', tool_response={'accepted': True}), phone.load_config())
+        self.assertIsNone(self.stop())
+        self.assertEqual(len(self.requests()), 1)
+        self.assertEqual(json.loads(self.requests()[0][-2])['message'], phone.QUESTION)
+        self.prompt('Here is my answer')
+        self.deliver(self.stop())
+        self.assertEqual(len(self.requests()), 2)
+
+    def test_cancelled_or_answered_question_is_not_delivered_later(self):
+        for tool, result in [('request_user_input', {'answers': {}}),
+                             ('request_user_input_async', {'accepted': False}),
+                             ('request_user_input_async', 'request_user_input unavailable in this mode')]:
+            self.prompt()
+            event = self.event('PreToolUse', tool_name=tool, tool_use_id='q1')
+            with patch.object(phone, 'launch_delivery_worker') as launch:
+                phone.handle(event, phone.load_config())
+            phone.handle(self.event('PostToolUse', tool_name=tool, tool_use_id='q1', tool_response=result), phone.load_config())
+            phone.delivery_worker(*launch.call_args.args, phone.load_config())
+        self.assertEqual(self.requests(), [])
+
+    def test_titles_distinguish_sessions_with_identical_project_and_name(self):
+        with patch.object(phone, 'session_title', return_value='Initialize Worker startup'):
+            state = {'cwd': str(self.home / 'same-project')}
+            self.assertNotEqual(phone.title_for('session-one', state), phone.title_for('session-two', state))
+
+    def test_yielded_exec_process_stays_awaited_until_completion(self):
+        self.prompt()
+        phone.handle(self.event('PreToolUse', tool_name='Bash', tool_use_id='job', tool_input={'command': 'sleep 20'}), phone.load_config())
+        phone.handle(self.event('PostToolUse', tool_name='Bash', tool_use_id='job', tool_response={'session_id': 42, 'exit_code': None}), phone.load_config())
+        self.assertEqual(self.read_state()['tasks']['job']['process_session'], '42')
+        self.deliver(self.stop())
+        self.assertIn('background task is still running', self.log.read_text())
+        phone.handle(self.event('PostToolUse', tool_name='write_stdin', tool_input={'session_id': 42}, tool_response={'exit_code': 0}), phone.load_config())
+        self.assertEqual(self.read_state()['tasks'], {})
+
+    def test_delivery_retries_only_failed_channel(self):
+        config = {'NTFY_TOPIC': 't', 'TELEGRAM_BOT_TOKEN': 'fake', 'TELEGRAM_CHAT_ID': '42'}
+        with phone.locked(phone.state_directory('test-session')) as state:
+            state['questions'] = {'q': {}}
+            phone.queue_delivery(state, 'q', phone.QUESTION, {'kind': 'question', 'key': 'q'})
+        clock = [100.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone.time, 'time', side_effect=lambda: clock[0]), patch.object(phone.time, 'sleep', side_effect=advance), patch.object(phone, 'send', side_effect=[{'ntfy'}, {'telegram'}]) as send:
+            phone.delivery_worker('test-session', 'q', config)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args_list[1].kwargs['skip'], {'ntfy'})
+        self.assertEqual(self.read_state()['deliveries']['q']['status'], 'delivered')
+
+    def test_resolved_wait_cancels_network_retries(self):
+        with phone.locked(phone.state_directory('test-session')) as state:
+            state['questions'] = {'q': {}}
+            phone.queue_delivery(state, 'q', phone.QUESTION, {'kind': 'question', 'key': 'q'})
+        def offline(*args, **kwargs):
+            self.prompt('Already answered')
+            return set()
+        with patch.object(phone, 'title_for', return_value='Codex · test'), patch.object(phone, 'send', side_effect=offline) as send:
+            phone.delivery_worker('test-session', 'q', phone.load_config())
+        self.assertEqual(send.call_count, 1)
+        self.assertNotIn('q', self.read_state()['deliveries'])
+
+    def test_real_concurrent_delivery_workers_send_only_once(self):
+        with phone.locked(phone.state_directory('test-session')) as state:
+            state['questions'] = {'q': {}}
+            phone.queue_delivery(state, 'q', phone.QUESTION, {'kind': 'question', 'key': 'q'})
+        workers = [subprocess.Popen([sys.executable, str(SCRIPT), '--deliver', 'test-session', 'q'], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
+        try:
+            for process in workers:
+                out, err = process.communicate(timeout=4)
+                self.assertEqual(process.returncode, 0, err)
+            self.assertEqual(len(self.requests()), 1)
+        finally:
+            for process in workers:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
+    def test_watcher_reports_process_death_and_pid_reuse_but_not_normal_exit(self):
+        directory = phone.state_directory('test-session')
+        for ended, observed, expected in [(True, '', 0), (False, '', 1), (False, 'another start time', 1)]:
+            with phone.locked(directory) as state:
+                state['owner'] = {'pid': 42, 'started': 'original start', 'token': 'owner'}
+                state['ended'] = ended
+                state['deliveries'] = {}
+            with patch.object(phone, 'process_identity', return_value=observed), patch.object(phone.time, 'sleep'), patch.object(phone, 'delivery_worker') as delivery:
+                phone.watch_owner('test-session', 'owner', phone.load_config())
+                self.assertEqual(delivery.call_count, expected)
+
+    def test_watcher_ignores_observation_errors_and_old_owner(self):
+        directory = phone.state_directory('test-session')
+        with phone.locked(directory) as state:
+            state['owner'] = {'pid': 42, 'started': 'original', 'token': 'owner'}
+        with patch.object(phone, 'process_identity', side_effect=[None, '', '']), patch.object(phone.time, 'sleep') as sleep, patch.object(phone, 'delivery_worker') as delivery:
+            phone.watch_owner('test-session', 'owner', phone.load_config())
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(delivery.call_count, 1)
+        with patch.object(phone, 'delivery_worker') as delivery:
+            phone.watch_owner('test-session', 'previous-owner', phone.load_config())
+        delivery.assert_not_called()
+
+    def test_exit_status_notifies_failure_but_not_quit_or_ctrl_c(self):
+        run = self.home / 'run'
+        run.mkdir()
+        (run / 'launch.json').write_text(json.dumps({'cwd': str(self.home / 'project')}))
+        (run / 'session.json').write_text('{"session_id":"test-session"}')
+        for code in [0, 130, -2, 1, -9]:
+            with patch.object(phone, 'launch_delivery_worker') as launch:
+                phone.report_exit(run, code, phone.load_config())
+            self.assertEqual(launch.call_count, int(code not in (0, 130, -2)))
+
+    def test_normal_exit_cancels_already_queued_crash_notification(self):
+        run = self.home / 'run'
+        run.mkdir()
+        (run / 'launch.json').write_text(json.dumps({'cwd': str(self.home)}))
+        (run / 'session.json').write_text('{"session_id":"test-session"}')
+        for code in (0, 130, -2):
+            with phone.locked(phone.state_directory('test-session')) as state:
+                key = phone.queue_failure(state, 'owner')
+            phone.report_exit(run, code, phone.load_config())
+            phone.delivery_worker('test-session', key, phone.load_config())
+        self.assertEqual(self.requests(), [])
+
+    def test_watcher_grace_allows_parent_to_report_normal_exit(self):
+        with phone.locked(phone.state_directory('test-session')) as state:
+            state['owner'] = {'pid': 42, 'started': 'original', 'token': 'owner'}
+        def parent_finishes(seconds):
+            with phone.locked(phone.state_directory('test-session')) as state:
+                state['ended'] = True
+        with patch.object(phone, 'process_identity', return_value=''), patch.object(phone.time, 'sleep', side_effect=parent_finishes), patch.object(phone, 'delivery_worker') as delivery:
+            phone.watch_owner('test-session', 'owner', phone.load_config())
+        delivery.assert_not_called()
+
+    def test_ntfy_retry_uses_stable_sequence_id(self):
+        phone.send({'NTFY_TOPIC': 't'}, 'Codex · test', phone.WAITING, notification_id='codex-fixed')
+        phone.send({'NTFY_TOPIC': 't'}, 'Codex · test', phone.WAITING, notification_id='codex-fixed')
+        self.assertEqual([json.loads(r[-2])['sequence_id'] for r in self.requests()], ['codex-fixed', 'codex-fixed'])
 
 
 if __name__ == '__main__':

@@ -43,7 +43,7 @@ class LaunchFailureTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as exited:runpy.run_path(str(ROOT/'scripts/launch.py'),run_name='__main__')
             self.assertEqual(exited.exception.code,7)
             log=run/'terminal-error.log';self.assertEqual(log.read_text(),'Error: fixture startup failure\n');self.assertEqual(log.stat().st_mode&0o777,0o600)
-            args=command.call_args.args[0];self.assertIn('capture-pane',args);self.assertEqual(args[-2:],['-t','%42'])
+            args=next(call.args[0] for call in command.call_args_list if 'capture-pane' in call.args[0]);self.assertEqual(args[-2:],['-t','%42'])
     def simulate_failure(self, text, code=1):
         spec=importlib.util.spec_from_file_location('friendly_launcher',ROOT/'scripts/codex-tools.py')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)

@@ -44,4 +44,12 @@ if result != 0:
             except (OSError, subprocess.TimeoutExpired):
                 pass
 (directory / 'exit-code').write_text(str(result))
+notifier = pathlib.Path(__file__).with_name('notify-phone.py')
+if notifier.exists():
+    try:
+        subprocess.run([sys.executable, str(notifier), '--exit', str(directory), str(result)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 sys.exit(result)
