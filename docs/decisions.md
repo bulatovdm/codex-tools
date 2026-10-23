@@ -47,3 +47,23 @@ Live выявил замену WORK_WORKER_HOME вложенным shell из zs
 Установлены только2 scripts с private backup, hooks/trust/shell/LaunchAgent не тронуты.
 TDD/28 Python tests и реальная empty cx→trusted hook→open participant→mail read/reply/
 processed выполнены; QA проект/broker изолированы после исправления и штатно закрыты.
+
+
+## 007 — Возвращаться в живой cx через штатный tmux attach
+
+Принято пользователем и реализовано23.10.2026 из сессии Work Worker по прямому
+поручению исправить повторяющуюся блокировку, установить, commit/push и затем
+остановить один конкретный старый запуск. Run прежде всегда создавал новый
+server, даже при живом detached Codex того же разговора.
+Решение: plain resume UUID ищет exact hook session ID в private run metadata и
+проверяет живую pane с точной launch.py command. Bare resume предлагает живые
+запуски текущей папки;0/Enter сохраняет native picker. Перед attach повторно
+проверяются identity и attached state; другой клиент/неоднозначность дают отказ
+без force detach. Dead/finished/corrupt/symlink metadata не кандидаты. Overrides,
+fork и новые запуски сохраняют прежнюю семантику; inherited env при attach остаётся
+у существующего процесса. tmux quoting нормализуется без исполнения команды.
+Альтернативы: убивать Codex при закрытии окна теряет фоновые задачи; удалять
+writer lock нарушает exclusivity; подменять штатный native picker сложно и
+связывает обвязку с внутренностями CLI. Locks/shared server/hooks не меняются.
+Последствия: два простых resume режима предотвращают лишний запуск; native picker
+и нестандартные resume options остаются вне автоматического reattach.

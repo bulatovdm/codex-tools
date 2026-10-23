@@ -108,3 +108,30 @@
   private backups и baseline checks; hooks/trust/shell/LaunchAgent не менялись.
   QA native /quit, exact own broker остановлен после disconnect, temp scripts удалены.
   Новый пустой cx в connected/enabled проекте подхватывает feature без MCP reload.
+
+
+## 2026-10-23 · возврат в detached cx
+
+- Native session работавшего агента:01a169c9-e25b-71f3-afe0-b42db869cce0; hook
+  journal находится в work-worker. Цель — устранить повторный запуск при живом
+  detached разговоре. На входе codex-tools checkout чист, HEAD33f584d.
+- Пользователь разрешил реализацию, установку, commit/push и после успешного push
+  завершение точного старого Codex в Work Worker; остальные процессы не трогаем.
+- Red: exact/bare resume создавали новый tmux server вопреки существующему live
+  run; assertion must reuse live run вместо старта второго Codex. Реализованы
+  exact ID discovery, project menu, attached/duplicate checks и recheck before attach.
+- Real tmux выявил внешние quotes в pane_start_command: отдельный test red→green
+  закрепил нормализацию. QA на временном HOME с sleep stand-in сначала потребовала
+  явного tmux path; это ограничение QA окружения, не дефект продукта.
+- Green:83 Python tests,5 existing platform skips. Изолированная real tmux/PTY
+  проверка подтвердила discovery, wrapper attach в existing pane без нового run,
+  clean detach; только собственный QA server удалён. Это tmux integration evidence,
+  не запуск новой model/native conversation. Нет новых mail/проектов.
+- Установка ограничена scripts/codex-tools.py с private backup; full installer
+  не используется, globals/hooks/trust/shell/LaunchAgent не меняются.
+- Actual installation выполнена с private backup; byte equality source/installed
+  подтверждена. Установленный launcher read-only обнаружил прежний detached native
+  разговор и текущий attached разговор раздельно. Полный suite в исходном checkout:
+  83 tests green,5 existing skips; git diff --check clean. Далее commit/push,
+  после подтверждения origin — остановка разрешённого пользователем старого
+  процесса с повторной проверкой PID/start time/argv/точного открытого rollout.

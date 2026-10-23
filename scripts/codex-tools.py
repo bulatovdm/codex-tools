@@ -99,12 +99,145 @@ def report_failure(directory, result):
         print('Причину не удалось прочитать автоматически; откройте terminal-error.log в каталоге диагностики.')
     print('Диагностика: ' + str(directory))
 
+def read_run(directory):
+    """Use only private hook identity; never infer a thread from cwd/history."""
+    if directory.is_symlink() or not re.fullmatch(r'[a-f0-9]{32}', directory.name):
+        return None
+    try:
+        if (directory / 'exit-code').exists():
+            return None
+        values = []
+        for name in ('session.json', 'launch.json'):
+            path = directory / name
+            if path.is_symlink() or path.stat().st_size > 65536:
+                return None
+            value = json.loads(path.read_text())
+            if not isinstance(value, dict):
+                return None
+            values.append(value)
+        session, launch = values
+        native = session.get('session_id')
+        if not isinstance(native, str) or str(uuid.UUID(native)) != native.lower():
+            return None
+        cwd = session.get('cwd')
+        if not isinstance(cwd, str) or not pathlib.Path(cwd).is_absolute():
+            return None
+        if launch.get('cli') != str(pathlib.Path.home() / '.local/bin/codex'):
+            return None
+        return {'directory': directory, 'session_id': native.lower(), 'cwd': cwd}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def run_status(tmux, run):
+    directory = run['directory']
+    prefix = [tmux, '-L', 'codex-tools-' + directory.name, '-f', '/dev/null']
+    try:
+        result = subprocess.run([*prefix, 'list-panes', '-t', 'codex', '-F',
+                                 '#{session_attached}\t#{pane_dead}\t#{pane_start_command}'],
+                                capture_output=True, text=True, timeout=1.5)
+        lines = result.stdout.splitlines()
+        if result.returncode != 0 or len(lines) != 1:
+            return None
+        attached, dead, command = lines[0].split('\t', 2)
+        expected = ['/usr/bin/python3', str(ROOT / 'launch.py'), str(directory)]
+        parts = shlex.split(command)
+        if len(parts) == 1:
+            parts = shlex.split(parts[0])
+        if dead != '0' or not attached.isdecimal() or parts != expected:
+            return None
+        return int(attached)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def live_runs(tmux, cwd=None):
+    root = pathlib.Path.home() / '.local/share/codex-tools/runs'
+    if root.is_symlink():
+        return []
+    runs = []
+    try:
+        directories = sorted(root.iterdir())
+    except OSError:
+        return runs
+    for directory in directories:
+        run = read_run(directory)
+        if run is None:
+            continue
+        try:
+            if cwd is not None and pathlib.Path(run['cwd']).resolve() != pathlib.Path(cwd).resolve():
+                continue
+        except (OSError, RuntimeError):
+            continue
+        attached = run_status(tmux, run)
+        if attached is not None:
+            run['attached'] = attached
+            runs.append(run)
+    return runs
+
+
+def reuse_resume(tmux, arguments, cwd):
+    exact = (len(arguments) == 2 and arguments[0] == 'resume'
+             and re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', arguments[1]))
+    if arguments != ['resume'] and not exact:
+        return None
+    runs = live_runs(tmux, None if exact else cwd)
+    if exact:
+        runs = [run for run in runs if run['session_id'] == arguments[1].lower()]
+        if not runs:
+            return None
+        if len(runs) != 1:
+            print('У разговора несколько живых запусков; автоматический выбор невозможен.')
+            for run in runs:
+                print('  ' + run['directory'].name)
+            return 1
+        chosen = runs[0]
+    else:
+        if not runs:
+            return None
+        print('Живые запуски текущего проекта:')
+        for index, run in enumerate(runs, 1):
+            state = 'отсоединён' if run['attached'] == 0 else 'подключён другой терминал'
+            print(f"{index}. {run['session_id']} — {state}")
+        print('0. Открыть обычный список сохранённых разговоров')
+        while True:
+            try:
+                choice = input('Вернуться в запуск (номер; Enter — обычный список): ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print('\nВозврат отменён.')
+                return 0
+            if choice in ('', '0'):
+                return None
+            if choice.isdecimal() and 1 <= int(choice) <= len(runs):
+                chosen = runs[int(choice) - 1]
+                break
+            print('Выберите номер из списка.')
+    # Recheck hook identity and liveness after the interactive selection.
+    current = read_run(chosen['directory'])
+    if current != {key: chosen[key] for key in ('directory', 'session_id', 'cwd')}:
+        print('Запуск изменился или завершился; повторите cx resume.')
+        return 1
+    attached = run_status(tmux, current)
+    if attached is None:
+        print('Запуск уже недоступен; повторите cx resume.')
+        return 1
+    if attached:
+        print('Этот разговор уже открыт: к запуску подключён другой терминал.')
+        return 1
+    print('Возвращаюсь в работающий Codex: ' + chosen['session_id'])
+    return subprocess.call([tmux, '-L', 'codex-tools-' + chosen['directory'].name,
+                            '-f', '/dev/null', 'attach-session', '-t', 'codex'])
+
+
 def run(arguments):
     tmux = tmux_path()
     if not tmux:
         raise RuntimeError('tmux is required: brew install tmux, or see docs/tmux.md')
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError('run requires an interactive terminal')
+    reused = reuse_resume(tmux, arguments, os.getcwd())
+    if reused is not None:
+        return reused
     identity = uuid.uuid4().hex
     directory = pathlib.Path.home() / '.local/share/codex-tools/runs' / identity
     directory.mkdir(parents=True, mode=0o700)
