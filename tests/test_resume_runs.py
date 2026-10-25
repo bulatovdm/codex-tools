@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).parents[1]
 SESSION = '01a13b63-241d-7723-a926-9aeed94857ac'
 RUN = 'a' * 32
+SAVED = '01a13b63-241d-7723-a926-9aeed94857ad'
 
 class Terminal(io.StringIO):
     def isatty(self):
@@ -41,6 +43,17 @@ class ResumeRunsTests(unittest.TestCase):
         (directory / 'session.json').write_text(json.dumps({'session_id':session, 'cwd':str(cwd or self.home)}))
         (directory / 'launch.json').write_text(json.dumps({'cwd':str(cwd or self.home), 'cli':str(self.home / '.local/bin/codex'), 'args':['resume'], 'environment':{}}))
 
+    def write_saved(self, session=SAVED, name='Названный разговор', title='Первый вопрос', cwd=None):
+        root = self.home / '.codex'; root.mkdir(exist_ok=True)
+        database = root / 'state_5.sqlite'
+        rollout = root / (session + '.jsonl'); rollout.touch()
+        with sqlite3.connect(database) as connection:
+            connection.execute('CREATE TABLE IF NOT EXISTS threads '
+                               '(id TEXT, cwd TEXT, name TEXT, title TEXT, recency_at_ms INTEGER, '
+                               'rollout_path TEXT, source TEXT, archived INTEGER)')
+            connection.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
+                               (session, str(cwd or self.home), name, title, 1000, str(rollout), 'cli'))
+
     def command(self, args, **kwargs):
         self.queried.append(args)
         if 'new-session' in args:
@@ -52,9 +65,9 @@ class ResumeRunsTests(unittest.TestCase):
         return subprocess.CompletedProcess(args, 0 if self.live else 1,
             f'{self.attached}\t{self.dead}\t{self.start_override or start}\n', '')
 
-    def invoke(self, args, choice=''):
+    def invoke(self, args, choice='', call_handler=None):
         output = Terminal()
-        with patch.object(Path, 'home', return_value=self.home), patch.object(self.module.os, 'getcwd', return_value=str(self.home)), patch.object(self.module, 'tmux_path', return_value='/fixture/tmux'), patch.object(sys, 'stdin', Terminal(choice)), contextlib.redirect_stdout(output), patch.object(self.module.subprocess, 'run', side_effect=self.command), patch.object(self.module.subprocess, 'call', side_effect=lambda args: self.calls.append(args) or 0):
+        with patch.object(Path, 'home', return_value=self.home), patch.object(self.module.os, 'getcwd', return_value=str(self.home)), patch.object(self.module, 'tmux_path', return_value='/fixture/tmux'), patch.object(sys, 'stdin', Terminal(choice)), contextlib.redirect_stdout(output), patch.object(self.module.subprocess, 'run', side_effect=self.command), patch.object(self.module.subprocess, 'call', side_effect=call_handler or (lambda args: self.calls.append(args) or 0)):
             result = self.module.run(args)
         return result, output.getvalue()
 
@@ -132,9 +145,9 @@ class ResumeRunsTests(unittest.TestCase):
         self.assertNotEqual(result, 0)
         self.assertEqual(self.calls, [])
 
-    def test_zero_preserves_native_history_picker(self):
+    def test_zero_cancels_without_opening_native_history_picker(self):
         with patch.object(Path, 'home', return_value=self.home), patch.object(self.module.subprocess, 'run', side_effect=self.command), patch.object(sys, 'stdin', Terminal('0\n')), contextlib.redirect_stdout(Terminal()):
-            self.assertIsNone(self.module.reuse_resume('/fixture/tmux', ['resume'], str(self.home)))
+            self.assertEqual(self.module.reuse_resume('/fixture/tmux', ['resume'], str(self.home)), 0)
         self.assertEqual(self.calls, [])
 
     def test_other_modes_and_unknown_arguments_keep_native_behavior(self):
@@ -165,12 +178,87 @@ class ResumeRunsTests(unittest.TestCase):
                 self.assertEqual(self.calls, [])
                 self.assertIn('cx resume ' + SESSION, output)
 
-    def test_native_last_and_overrides_are_preserved_when_user_selects_zero(self):
+    def test_last_and_overrides_do_not_open_a_second_picker_on_cancel(self):
         args = ['resume', '--last', '-m', 'other']
         candidate = {'directory': self.directory, 'session_id': SESSION, 'cwd': str(self.home), 'attached': 0}
         with patch.object(self.module, 'live_runs', return_value=[candidate]), patch.object(sys, 'stdin', Terminal('0\n')), contextlib.redirect_stdout(Terminal()):
-            self.assertIsNone(self.module.reuse_resume('/fixture/tmux', args, str(self.home)))
+            self.assertEqual(self.module.reuse_resume('/fixture/tmux', args, str(self.home)), 0)
         self.assertEqual(args, ['resume', '--last', '-m', 'other'])
+
+    def test_one_list_shows_saved_name_project_and_state_and_selects_exact_id(self):
+        self.write_saved()
+        output = Terminal()
+        with patch.object(Path, 'home', return_value=self.home), patch.object(self.module.subprocess, 'run', side_effect=self.command), patch.object(sys, 'stdin', Terminal('2\n')), contextlib.redirect_stdout(output):
+            selected = self.module.reuse_resume('/fixture/tmux', ['resume'], str(self.home))
+        self.assertEqual(selected, ('native', ['resume', SAVED]))
+        self.assertIn('Названный разговор', output.getvalue())
+        self.assertIn('в истории', output.getvalue())
+        self.assertIn('работает в фоне', output.getvalue())
+        self.assertNotIn('обычный список', output.getvalue())
+
+    def test_saved_name_has_priority_over_prompt_and_index_title(self):
+        self.write_saved(session=SESSION, name='Моё точное имя')
+        index = self.home / '.codex/session_index.jsonl'
+        index.write_text(json.dumps({'id': SESSION, 'thread_name': 'Старое имя'}) + '\n')
+        result, output = self.invoke(['resume'], '0\n')
+        self.assertEqual(result, 0)
+        self.assertIn('Моё точное имя', output)
+        self.assertNotIn('Первый вопрос', output)
+
+    def test_saved_without_name_uses_title_then_generic_label(self):
+        self.write_saved(name='', title='Осмысленный заголовок')
+        with patch.object(Path, 'home', return_value=self.home):
+            saved = self.module.saved_sessions(str(self.home), False)
+        self.assertEqual(self.module.display_title(saved[0]), 'Осмысленный заголовок')
+        self.assertEqual(self.module.display_title({'name':'  ', 'title':'Осмысленный заголовок'}), 'Осмысленный заголовок')
+        self.assertEqual(self.module.display_title({'name':'', 'title':''}), 'Без названия')
+
+    def test_saved_selection_rechecks_live_state_before_new_client(self):
+        self.write_saved()
+        original = self.module.live_runs
+        calls = [0]
+        def changing(tmux, cwd=None):
+            calls[0] += 1
+            if calls[0] == 2:
+                return [{'directory':self.directory, 'session_id':SAVED, 'cwd':str(self.home), 'attached':0}]
+            return original(tmux, cwd)
+        with patch.object(Path, 'home', return_value=self.home), patch.object(self.module, 'live_runs', side_effect=changing), patch.object(self.module.subprocess, 'run', side_effect=self.command), patch.object(sys, 'stdin', Terminal('2\n')), contextlib.redirect_stdout(Terminal()):
+            self.assertEqual(self.module.reuse_resume('/fixture/tmux', ['resume'], str(self.home)), 1)
+
+    def test_native_selector_flags_removed_after_saved_selection(self):
+        self.assertEqual(self.module.selected_resume_arguments(['-C', '/tmp', 'resume', '--all', '--last', '-m', 'model'], SAVED),
+                         ['-C', '/tmp', 'resume', SAVED, '-m', 'model'])
+
+    def test_saved_choice_starts_one_native_resume_for_exact_id(self):
+        self.write_saved()
+        self.live = False
+        launched = []
+        original = self.command
+        def command(args, **kwargs):
+            if 'new-session' in args:
+                return subprocess.CompletedProcess(args, 0, '', '')
+            return original(args, **kwargs)
+        def attach(args):
+            runs = list(self.directory.parent.iterdir())
+            created = next(run for run in runs if run != self.directory)
+            launched.append(json.loads((created / 'launch.json').read_text())['args'])
+            (created / 'exit-code').write_text('0')
+            return 0
+        with patch.object(self, 'command', side_effect=command):
+            result, output = self.invoke(['resume'], '1\n', call_handler=attach)
+        self.assertEqual(result, 0)
+        self.assertEqual(launched, [['resume', SAVED]])
+        self.assertIn('Открываю сохранённый разговор', output)
+
+    def test_saved_all_shows_other_projects_and_name(self):
+        self.write_saved(cwd=self.home / 'other')
+        with patch.object(Path, 'home', return_value=self.home):
+            self.assertEqual(self.module.saved_sessions(str(self.home), False), [])
+            self.assertEqual(len(self.module.saved_sessions(str(self.home), True)), 1)
+
+    def test_unreadable_catalog_falls_back_to_one_native_picker(self):
+        self.live = False
+        self.assertIsNone(self.module.reuse_resume('/fixture/tmux', ['resume'], str(self.home)))
 
     def test_subdirectory_is_same_project_and_all_includes_other_project(self):
         (self.home / '.git').mkdir()

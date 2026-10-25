@@ -8,6 +8,7 @@ import subprocess
 import sys
 import uuid
 import re
+import sqlite3
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -255,6 +256,58 @@ def run_titles(runs):
     return titles
 
 
+def saved_sessions(cwd, all_projects, include_non_interactive=False):
+    """Read the native local session catalog; never inspect conversation bodies."""
+    database = pathlib.Path(os.environ.get('CODEX_HOME', str(pathlib.Path.home() / '.codex'))) / 'state_5.sqlite'
+    if not database.is_file():
+        return []
+    try:
+        with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=0.5) as connection:
+            sources = ('cli', 'vscode', 'exec') if include_non_interactive else ('cli', 'vscode')
+            rows = connection.execute(
+                'SELECT id, cwd, name, title, recency_at_ms, rollout_path FROM threads '
+                'WHERE archived = 0 AND source IN (' + ','.join('?' for _ in sources) + ') '
+                'ORDER BY recency_at_ms DESC LIMIT 1000', sources).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+    sessions = []
+    for native, directory, name, title, updated, rollout in rows:
+        try:
+            if not isinstance(native, str) or str(uuid.UUID(native)) != native.lower():
+                continue
+            if not isinstance(directory, str) or not pathlib.Path(directory).is_absolute():
+                continue
+            if not all_projects and project_directory(directory) != project_directory(cwd):
+                continue
+            if not isinstance(rollout, str) or not pathlib.Path(rollout).is_file():
+                continue
+        except (ValueError, TypeError, OSError, RuntimeError):
+            continue
+        sessions.append({'session_id': native.lower(), 'cwd': directory,
+                         'name': name if isinstance(name, str) else '',
+                         'title': title if isinstance(title, str) else '',
+                         'updated': updated if isinstance(updated, int) else 0})
+    return sessions
+
+
+def display_title(session, fallback=None):
+    title = ''
+    for candidate in (session.get('name'), fallback, session.get('title')):
+        if isinstance(candidate, str):
+            title = re.sub(r'[\x00-\x1f\x7f]+', ' ', candidate).strip()
+            if title:
+                break
+    title = title or 'Без названия'
+    return (title[:87] + '…') if len(title) > 88 else title
+
+
+def selected_resume_arguments(arguments, native):
+    selected = [argument for argument in arguments if argument not in ('--last', '--all')]
+    index = selected.index('resume')
+    selected.insert(index + 1, native)
+    return selected
+
+
 def configure_lifecycle(tmux, directory):
     prefix = [tmux, '-L', 'codex-tools-' + directory.name, '-f', '/dev/null']
     # Arm only on attach: a freshly created detached server must survive setup.
@@ -306,29 +359,55 @@ def reuse_resume(tmux, arguments, cwd):
             return 1
         chosen = runs[0]
     else:
-        if not runs:
+        saved = saved_sessions(request['cwd'], request['all'],
+                               '--include-non-interactive' in arguments)
+        live_ids = {run['session_id'] for run in runs}
+        entries = [dict(run, kind='live') for run in runs]
+        entries.extend(dict(session, kind='saved') for session in saved
+                       if session['session_id'] not in live_ids)
+        if not entries:
             return None
-        print('Живые запуски всех проектов:' if request['all'] else 'Живые запуски текущего проекта:')
-        for index, run in enumerate(runs, 1):
-            state = 'отсоединён' if run['attached'] == 0 else 'подключён другой терминал'
-            print(f"{index}. {run['session_id']} — {state}")
-        print('0. Продолжить штатный resume (включая --last/параметры, если заданы)')
+        names = run_titles(runs)
+        saved_by_id = {session['session_id']: session for session in saved}
+        print('Разговоры всех проектов:' if request['all'] else 'Разговоры текущего проекта:')
+        for index, entry in enumerate(entries, 1):
+            if entry['kind'] == 'saved':
+                state = 'в истории'
+            else:
+                state = 'работает в фоне' if entry['attached'] == 0 else 'открыта в другом терминале'
+            details = saved_by_id.get(entry['session_id'], entry)
+            title = display_title(details, names.get(entry['session_id']))
+            project = project_directory(entry['cwd'])
+            print(f'{index}. {title} — {project} — {state}')
+        print('0. Отмена')
         while True:
             try:
-                choice = input('Вернуться в запуск (номер; Enter — обычный список): ').strip()
+                choice = input('Открыть разговор (номер; Enter — отмена): ').strip()
             except (EOFError, KeyboardInterrupt):
                 print('\nВозврат отменён.')
                 return 0
             if choice in ('', '0'):
-                return None
-            if choice.isdecimal() and 1 <= int(choice) <= len(runs):
-                chosen = runs[int(choice) - 1]
-                if request['overrides']:
-                    print('Выбранный разговор уже работает; новые параметры/prompt не применены.')
-                    print('Вернитесь без overrides: cx resume ' + chosen['session_id'])
-                    return 1
+                print('Возврат отменён.')
+                return 0
+            if choice.isdecimal() and 1 <= int(choice) <= len(entries):
+                chosen = entries[int(choice) - 1]
                 break
             print('Выберите номер из списка.')
+        if chosen['kind'] == 'saved':
+            # The run wrapper starts exactly this saved conversation. It must
+            # never launch the native picker again after the user chose an ID.
+            if any(run['session_id'] == chosen['session_id'] for run in live_runs(tmux, None)):
+                print('Разговор стал работающим; повторите cx resume.')
+                return 1
+            print('Открываю сохранённый разговор: ' + chosen['session_id'])
+            return ('native', selected_resume_arguments(arguments, chosen['session_id']))
+        if sum(run['session_id'] == chosen['session_id'] for run in runs) != 1:
+            print('У разговора несколько живых запусков; автоматический выбор невозможен.')
+            return 1
+        if request['overrides']:
+            print('Выбранный разговор уже работает; новые параметры/prompt не применены.')
+            print('Вернитесь без overrides: cx resume ' + chosen['session_id'])
+            return 1
     # Recheck hook identity and liveness after the interactive selection.
     current = read_run(chosen['directory'])
     if current != {key: chosen[key] for key in ('directory', 'session_id', 'cwd')}:
@@ -355,6 +434,9 @@ def run(arguments):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise RuntimeError('run requires an interactive terminal')
     reused = reuse_resume(tmux, arguments, os.getcwd())
+    if isinstance(reused, tuple) and reused[0] == 'native':
+        arguments = reused[1]
+        reused = None
     if reused is not None:
         return reused
     identity = uuid.uuid4().hex

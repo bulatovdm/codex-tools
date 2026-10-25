@@ -4,10 +4,12 @@ CODEX_TOOLS_LIVE_TMUX=1 python3 -m unittest discover -s tests -p test_tmux_lifec
 """
 import fcntl
 import importlib.util
+import json
 import os
 from pathlib import Path
 import pty
 import select
+import sqlite3
 import shutil
 import signal
 import struct
@@ -152,3 +154,62 @@ while True:
         os.write(fd, b'crash\n')
         self.wait_for(lambda: not self.alive())
         self.assertEqual((self.directory / 'exit-code').read_text(), '2')
+
+    def test_unified_saved_choice_starts_exact_native_resume_without_second_picker(self):
+        home = Path(self.tmp.name) / 'home'
+        cli = home / '.local/bin/codex'
+        cli.parent.mkdir(parents=True)
+        cli.write_text('''#!/usr/bin/python3
+import json, pathlib, sys
+pathlib.Path.home().joinpath('selected-arguments.json').write_text(json.dumps(sys.argv[1:]))
+''')
+        cli.chmod(0o700)
+        codex_home = home / '.codex'; codex_home.mkdir()
+        native = str(uuid.uuid4())
+        rollout = codex_home / (native + '.jsonl'); rollout.touch()
+        with sqlite3.connect(codex_home / 'state_5.sqlite') as connection:
+            connection.execute('CREATE TABLE threads '
+                               '(id TEXT, cwd TEXT, name TEXT, title TEXT, recency_at_ms INTEGER, '
+                               'rollout_path TEXT, source TEXT, archived INTEGER)')
+            connection.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, 0)',
+                               (native, self.tmp.name, 'Именованный разговор', 'Первый вопрос',
+                                1000, str(rollout), 'cli'))
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.chdir(self.tmp.name)
+            env = dict(os.environ, HOME=str(home), CODEX_HOME=str(codex_home),
+                       TERM='xterm-256color', PATH=str(Path(TMUX).parent) + ':' + os.environ.get('PATH', ''))
+            env.pop('TMUX', None)
+            os.execve('/usr/bin/python3', ['/usr/bin/python3', str(ROOT / 'scripts/codex-tools.py'),
+                                         'run', 'resume'], env)
+        reaped = False
+        try:
+            output = b''
+            deadline = time.monotonic() + 8
+            while 'Открыть разговор'.encode() not in output and time.monotonic() < deadline:
+                if select.select([fd], [], [], .1)[0]:
+                    output += os.read(fd, 65536)
+            self.assertIn('Именованный разговор'.encode(), output)
+            os.write(fd, b'1\n')
+            selected = home / 'selected-arguments.json'
+            self.wait_for(lambda: selected.exists())
+            self.assertEqual(json.loads(selected.read_text()), ['--no-daemon', 'resume', native])
+            while time.monotonic() < deadline + 8:
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    reaped = True
+                    break
+                time.sleep(.05)
+            self.assertTrue(reaped, 'wrapper must finish after the selected fake CLI exits')
+        finally:
+            for directory in (home / '.local/share/codex-tools/runs').glob('*'):
+                if len(directory.name) == 32:
+                    subprocess.run([TMUX, '-L', 'codex-tools-' + directory.name, '-f', '/dev/null',
+                                    'kill-server'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.close(fd)
+            if not reaped:
+                try:
+                    if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                        os.kill(pid, signal.SIGTERM)
+                        os.waitpid(pid, 0)
+                except (ChildProcessError, ProcessLookupError):
+                    pass

@@ -161,3 +161,27 @@
   атомарно с baseline HEAD check; private backup lifecycle-20261025-170948.
   Source/installed bytes совпали. Hooks/trust, broker и глобальные настройки
   не менялись; старый server получит политику только после cx resume.
+
+## 2026-10-25 · один выбор разговора
+
+- Пользователь заметил, что старый выбор0 в cx resume переводит ко второму
+  native picker, где уже работающие разговоры иногда блокируются. Попросил
+  показывать понятное название и сохранённое имя, если оно задано.
+- Локальный state_5.sqlite (readonly) содержит native id, cwd, name/title,
+  recency и rollout_path. На этой машине46 доступных cli/vscode записей всех
+  проектов,7 для текущего; почти все имеют сохранённое имя. Bare cx resume
+  объединяет их с проверенными live cx runs без чтения текста разговоров.
+- Меню показывает name → index thread_name для живого run → title → «Без
+  названия», проект и наблюдаемое состояние. Выбор live подключает tmux; выбор
+  истории создаёт native resume с точным UUID. Второй picker устранён. При
+  отсутствии каталога остаётся один native fallback. Прямой codex/другое
+  приложение нельзя надёжно опознать как живой cx run: статус «в истории» не
+  утверждает, что writer свободен.
+- Проверено111 tests,5 существующих Python3.9 skips, включая7 live tmux/PTY
+  сценариев. Новый end-to-end тест с fake Codex подтвердил: одно меню показало
+  сохранённое имя и выбрало точный ID, без native picker. Установлен только
+  scripts/codex-tools.py с baseline HEAD check и private backup
+  unified-resume-20261025-181345; source/installed bytes совпадают.
+  После прогона добавлена защита от имени из одних пробелов;32 целевых теста
+  green. Финальный launcher установлен с отдельной private backup
+  unified-resume-final-20261025-181425 и byte equality.
