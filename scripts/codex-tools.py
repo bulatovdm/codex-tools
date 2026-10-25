@@ -165,7 +165,7 @@ def live_runs(tmux, cwd=None):
         if run is None:
             continue
         try:
-            if cwd is not None and pathlib.Path(run['cwd']).resolve() != pathlib.Path(cwd).resolve():
+            if cwd is not None and project_directory(run['cwd']) != project_directory(cwd):
                 continue
         except (OSError, RuntimeError):
             continue
@@ -176,16 +176,129 @@ def live_runs(tmux, cwd=None):
     return runs
 
 
+def project_directory(cwd):
+    path = pathlib.Path(cwd).resolve()
+    return next((parent for parent in (path, *path.parents) if (parent / '.git').exists()), path)
+
+
+def resume_request(arguments, cwd):
+    """Parse selectors, without interpreting user prompts or executing config."""
+    valued = {'-C', '--cd', '-m', '--model', '-p', '--profile', '-c', '--config',
+              '-s', '--sandbox', '-a', '--ask-for-approval', '--add-dir',
+              '--enable', '--disable', '--local-provider', '--remote', '--remote-auth-token-env', '-i', '--image'}
+    flags = {'--last', '--all', '--include-non-interactive', '--no-alt-screen', '--no-daemon',
+             '--search', '--oss', '--strict-config', '--worktree', '--approve-for-me',
+             '--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust'}
+    request = {'cwd': cwd, 'target': None, 'all': False, 'last': False, 'overrides': False}
+    found = False
+    index = 0
+    while index < len(arguments):
+        arg = arguments[index]
+        option, equal, value = arg.partition('=')
+        if option in ('--remote', '--remote-auth-token-env', '--worktree'):
+            return None
+        if option in valued:
+            if not equal:
+                index += 1
+                if index >= len(arguments):
+                    return None
+                value = arguments[index]
+            if not value or value.startswith('-'):
+                return None
+            if option in ('-C', '--cd'):
+                request['cwd'] = str(pathlib.Path(cwd) / value)
+            else:
+                request['overrides'] = True
+        elif arg in flags:
+            if arg in ('--all', '--last'):
+                if not found:
+                    return None
+                request[arg[2:]] = True
+            elif arg not in ('--include-non-interactive', '--no-alt-screen', '--no-daemon'):
+                request['overrides'] = True
+        elif arg.startswith('-'):
+            return None
+        elif not found:
+            if arg != 'resume':
+                return None
+            found = True
+        elif request['target'] is None:
+            request['target'] = arg
+        else:
+            # A follow-up prompt cannot silently be discarded when reattaching.
+            request['overrides'] = True
+        index += 1
+    return request if found else None
+
+
+def run_titles(runs):
+    ids = {run['session_id'] for run in runs}
+    titles = {}
+    home = pathlib.Path(os.environ.get('CODEX_HOME', str(pathlib.Path.home() / '.codex')))
+    try:
+        with (home / 'session_index.jsonl').open('rb') as source:
+            source.seek(0, 2)
+            offset = max(0, source.tell() - 5_000_000)
+            source.seek(offset)
+            if offset:
+                source.readline()
+            for line in source:
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                if (isinstance(value, dict) and isinstance(value.get('id'), str)
+                        and value['id'] in ids and isinstance(value.get('thread_name'), str)):
+                    titles[value['id']] = value['thread_name']
+    except OSError:
+        pass
+    return titles
+
+
+def configure_lifecycle(tmux, directory):
+    prefix = [tmux, '-L', 'codex-tools-' + directory.name, '-f', '/dev/null']
+    # Arm only on attach: a freshly created detached server must survive setup.
+    subprocess.run([*prefix, 'set-hook', '-g', 'client-attached',
+                    'set-option -t codex destroy-unattached on'], check=True)
+    # Deliberate prefix+d preserves the run; closing the terminal does not.
+    subprocess.run([*prefix, 'bind-key', 'd', 'set-option', '-t', 'codex',
+                    'destroy-unattached', 'off', '\\;', 'detach-client'], check=True)
+
+
+def finish_attachment(directory, attached, tmux):
+    if (directory / 'exit-code').exists():
+        result = int((directory / 'exit-code').read_text())
+        if result == 0:
+            shutil.rmtree(directory, ignore_errors=True)
+        else:
+            report_failure(directory, result)
+        return result
+    run = read_run(directory)
+    if run is not None and run_status(tmux, run) is not None:
+        print('Codex сохранён в фоне. Вернуться: cx resume ' + run['session_id'])
+    else:
+        print('Подключение завершено; живой запуск не подтверждён. Диагностика: ' + str(directory))
+    return attached
+
+
 def reuse_resume(tmux, arguments, cwd):
-    exact = (len(arguments) == 2 and arguments[0] == 'resume'
-             and re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', arguments[1]))
-    if arguments != ['resume'] and not exact:
+    request = resume_request(arguments, cwd)
+    if request is None:
         return None
-    runs = live_runs(tmux, None if exact else cwd)
-    if exact:
-        runs = [run for run in runs if run['session_id'] == arguments[1].lower()]
+    target = request['target']
+    runs = live_runs(tmux, None if target or request['all'] else request['cwd'])
+    if target:
+        exact = re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', target)
+        titles = {} if exact else run_titles(runs)
+        runs = [run for run in runs if run['session_id'] == target.lower()] if exact else [
+            run for run in runs if titles.get(run['session_id']) == target]
         if not runs:
             return None
+        if request['overrides']:
+            print('Разговор уже работает. Новые параметры или prompt нельзя применить через attach.')
+            print('Вернитесь без overrides: cx resume ' + runs[0]['session_id'])
+            print('Для полного завершения: /quit или /exit внутри этого Codex.')
+            return 1
         if len(runs) != 1:
             print('У разговора несколько живых запусков; автоматический выбор невозможен.')
             for run in runs:
@@ -195,11 +308,11 @@ def reuse_resume(tmux, arguments, cwd):
     else:
         if not runs:
             return None
-        print('Живые запуски текущего проекта:')
+        print('Живые запуски всех проектов:' if request['all'] else 'Живые запуски текущего проекта:')
         for index, run in enumerate(runs, 1):
             state = 'отсоединён' if run['attached'] == 0 else 'подключён другой терминал'
             print(f"{index}. {run['session_id']} — {state}")
-        print('0. Открыть обычный список сохранённых разговоров')
+        print('0. Продолжить штатный resume (включая --last/параметры, если заданы)')
         while True:
             try:
                 choice = input('Вернуться в запуск (номер; Enter — обычный список): ').strip()
@@ -210,6 +323,10 @@ def reuse_resume(tmux, arguments, cwd):
                 return None
             if choice.isdecimal() and 1 <= int(choice) <= len(runs):
                 chosen = runs[int(choice) - 1]
+                if request['overrides']:
+                    print('Выбранный разговор уже работает; новые параметры/prompt не применены.')
+                    print('Вернитесь без overrides: cx resume ' + chosen['session_id'])
+                    return 1
                 break
             print('Выберите номер из списка.')
     # Recheck hook identity and liveness after the interactive selection.
@@ -224,9 +341,11 @@ def reuse_resume(tmux, arguments, cwd):
     if attached:
         print('Этот разговор уже открыт: к запуску подключён другой терминал.')
         return 1
+    configure_lifecycle(tmux, chosen['directory'])
     print('Возвращаюсь в работающий Codex: ' + chosen['session_id'])
-    return subprocess.call([tmux, '-L', 'codex-tools-' + chosen['directory'].name,
+    result = subprocess.call([tmux, '-L', 'codex-tools-' + chosen['directory'].name,
                             '-f', '/dev/null', 'attach-session', '-t', 'codex'])
+    return finish_attachment(chosen['directory'], result, tmux)
 
 
 def run(arguments):
@@ -258,17 +377,13 @@ def run(arguments):
     settings = {'status': 'on', 'status-position': 'bottom', 'status-interval': '2', 'status-format[0]': '#(' + command + ')', 'status-style': 'fg=colour250,bg=colour235', 'mouse': 'on', 'exit-empty': 'on'}
     for key, value in settings.items():
         subprocess.run([*prefix, 'set-option', '-g', key, value], check=True)
+    configure_lifecycle(tmux, directory)
+    print('Ctrl-C прерывает работу; на пустом вводе выходит. /quit — полный выход.')
+    print('Закрытие окна завершает запуск. Ctrl-B, затем D — сохранить в фоне.')
+    sys.stdout.flush()
     (directory / 'ready').touch()
     attached = subprocess.call([*prefix, 'attach-session', '-t', 'codex'])
-    if (directory / 'exit-code').exists():
-        result = int((directory / 'exit-code').read_text())
-        if result == 0:
-            shutil.rmtree(directory)
-        else:
-            report_failure(directory, result)
-        return result
-    print('Detached; return with: ' + shlex.join([tmux, '-L', socket, 'attach']))
-    return attached
+    return finish_attachment(directory, attached, tmux)
 
 def main():
     args = sys.argv[1:]

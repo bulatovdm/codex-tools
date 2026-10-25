@@ -135,3 +135,29 @@
   83 tests green,5 existing skips; git diff --check clean. Далее commit/push,
   после подтверждения origin — остановка разрешённого пользователем старого
   процесса с повторной проверкой PID/start time/argv/точного открытого rollout.
+
+## 2026-10-25 · жизненный цикл cx и расширенный resume
+
+- Повторный screenshot writer conflict; пользователь обычно использует Ctrl-C,
+  запросил все сценарии. Readonly диагностика: один живой detached Work Worker
+  run988d2e4bc018445c8ed683dc6fef2444, native01a13b63-241d-7723-a926-9aeed94857ac.
+  Сам pane не показывает writer conflict; старый клиент реально продолжает жить.
+  Старые процессы и locks не изменяли.
+- Новая политика отдельных tmux серверов: close завершает запуск; Ctrl-B,D
+  сохраняет, reattach снова включает завершение при close. Real tmux выявил
+  ошибку экранирования ';' в bind-key, исправлено на nested escaped separator;
+  шесть интеграционных сценариев green. Проверяются только собственные QA servers.
+- Resume расширен: -C, project subdirectories, --all, --last с явным выбором,
+  точные имена из ограниченного локального index после проверки live identity.
+  Overrides/prompt не отбрасываются при attach; старый native fallback сохраняется.
+  Добавлены проверки ambiguity, Ctrl-C/EOF, exit status/cleanup после reattach,
+  исчезновения run во время выбора; corrupt/stale/foreign metadata исключаются.
+- Реальный пустой Codex0.162.1: idle Ctrl-C exit0; отдельное закрытие PTY с source
+  wrapper завершило native child и собственный tmux. Hooks disabled, model task
+  не отправляли. Active interrupt моделируется stand-in, не выдается за model QA.
+  Физическая перезагрузка не выполнялась; отсутствие живой pane покрыто тестами.
+- CODEX_TOOLS_LIVE_TMUX=1 /usr/bin/python3 -m unittest discover -s tests:
+  102 tests,5 existing platform skips. Только scripts/codex-tools.py установлен
+  атомарно с baseline HEAD check; private backup lifecycle-20261025-170948.
+  Source/installed bytes совпали. Hooks/trust, broker и глобальные настройки
+  не менялись; старый server получит политику только после cx resume.
