@@ -116,6 +116,19 @@ while True:
         os.close(fd)
         self.wait_for(lambda: not self.alive())
 
+    def test_wrapper_observes_window_close_signal(self):
+        marker = self.directory / 'normal-close'
+        pid, fd = pty.fork()
+        if pid == 0:
+            self.module.attach_with_close_marker(TMUX, self.directory)
+            os._exit(0)
+        self.clients.append((pid, fd))
+        self.wait_for(lambda: self.command('show-options', '-v', '-t', 'codex',
+                                          'destroy-unattached', check=False).stdout.strip() == 'on')
+        os.close(fd)
+        self.wait_for(lambda: not self.alive())
+        self.assertTrue(marker.exists())
+
     def test_explicit_detach_survives_and_next_window_close_ends_run(self):
         fd = self.attach()
         os.write(fd, b'\x02d')

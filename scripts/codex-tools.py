@@ -9,6 +9,7 @@ import sys
 import uuid
 import re
 import sqlite3
+import signal
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -318,6 +319,26 @@ def configure_lifecycle(tmux, directory):
                     'destroy-unattached', 'off', '\\;', 'detach-client'], check=True)
 
 
+def attach_with_close_marker(tmux, directory):
+    """Record a terminal hangup before tmux destroys this private run."""
+    previous = signal.getsignal(signal.SIGHUP)
+
+    def terminal_closed(signum, frame):
+        try:
+            descriptor = os.open(directory / 'normal-close',
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    prefix = [tmux, '-L', 'codex-tools-' + directory.name, '-f', '/dev/null']
+    signal.signal(signal.SIGHUP, terminal_closed)
+    try:
+        return subprocess.call([*prefix, 'attach-session', '-t', 'codex'])
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
 def finish_attachment(directory, attached, tmux):
     if (directory / 'exit-code').exists():
         result = int((directory / 'exit-code').read_text())
@@ -422,8 +443,7 @@ def reuse_resume(tmux, arguments, cwd):
         return 1
     configure_lifecycle(tmux, chosen['directory'])
     print('Возвращаюсь в работающий Codex: ' + chosen['session_id'])
-    result = subprocess.call([tmux, '-L', 'codex-tools-' + chosen['directory'].name,
-                            '-f', '/dev/null', 'attach-session', '-t', 'codex'])
+    result = attach_with_close_marker(tmux, chosen['directory'])
     return finish_attachment(chosen['directory'], result, tmux)
 
 
@@ -464,7 +484,7 @@ def run(arguments):
     print('Закрытие окна завершает запуск. Ctrl-B, затем D — сохранить в фоне.')
     sys.stdout.flush()
     (directory / 'ready').touch()
-    attached = subprocess.call([*prefix, 'attach-session', '-t', 'codex'])
+    attached = attach_with_close_marker(tmux, directory)
     return finish_attachment(directory, attached, tmux)
 
 def main():

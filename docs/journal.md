@@ -185,3 +185,21 @@
   После прогона добавлена защита от имени из одних пробелов;32 целевых теста
   green. Финальный launcher установлен с отдельной private backup
   unified-resume-final-20261025-181425 и byte equality.
+
+## 2026-10-26 · ложная авария при закрытии окна
+
+- Локальное состояние notify показало несколько delivered failure без exit code
+  26.10, в том числе после закрытия CLI окон. Код destroy-unattached убивает
+  private tmux/pane, поэтому native SessionEnd и launch.py/report_exit могут не
+  успеть сообщить штатный выход; owner watcher отправлял unexpected через2s.
+- QA tmux подтвердил: client-detached hook после потери PTY не успевает создать
+  отметку, зато wrapper получает SIGHUP до окончания attach. Он записывает
+  private normal-close; watcher по привязке CODEX_TOOLS_RUN игнорирует такой
+  выход. Без отметки авария всё ещё уведомляет. Старые привязки очищаются на
+  SessionStart без cx. Ни один рабочий tmux или lock не изменён.
+- CODEX_TOOLS_LIVE_TMUX=1 /usr/bin/python3 -m unittest discover -s tests:
+  115 tests,5 existing platform skips. Установлены только launcher и notifier
+  с baseline HEAD check и private backup normal-close-20261026-135953;
+  source/installed bytes подтверждены. Новая метка доступна новым процессам
+  wrapper, уже открытый cx загрузил прежний код и при закрытии ещё может дать
+  одно ложное уведомление.

@@ -505,6 +505,14 @@ def queue_failure(state, token, code=None):
     return key
 
 
+def managed_close(state):
+    run = state.get('managed_run')
+    if not isinstance(run, str) or not re.fullmatch(r'[a-f0-9]{32}', run):
+        return False
+    directory = pathlib.Path.home() / '.local/share/codex-tools/runs' / run
+    return not directory.is_symlink() and (directory / 'normal-close').is_file()
+
+
 def watch_owner(session, token, config):
     directory = state_directory(session)
     while True:
@@ -522,6 +530,12 @@ def watch_owner(session, token, config):
                 continue
             with locked(directory) as state:
                 if state.get('owner', {}).get('token') != token or state.get('ended'):
+                    return
+                if managed_close(state):
+                    state['ended'] = True
+                    state.pop('pending', None)
+                    state['input_pending'] = {}
+                    state['questions'] = {}
                     return
                 key = queue_failure(state, token)
                 state['ended'] = True
@@ -548,7 +562,7 @@ def report_exit(directory, code, config):
     with locked(state_directory(session)) as state:
         state.setdefault('cwd', captured.get('cwd') or launch['cwd'])
         state['ended'] = True
-        if code in (0, 130, -2):
+        if code in (0, 130, -2) or (directory / 'normal-close').is_file():
             state.pop('failure_token', None)
             state.pop('pending', None)
             state['input_pending'] = {}
@@ -576,6 +590,11 @@ def handle(event, config):
         if kind == 'SessionStart':
             state['ended'] = False
             state.pop('failure_token', None)
+            run = os.environ.get('CODEX_TOOLS_RUN', '')
+            if re.fullmatch(r'[a-f0-9]{32}', run):
+                state['managed_run'] = run
+            else:
+                state.pop('managed_run', None)
         if source == 'cli' and (meta.get('id') or meta.get('session_id')) == session and (
                 kind == 'SessionStart' or not state.get('owner_attempted')):
             state['owner_attempted'] = True

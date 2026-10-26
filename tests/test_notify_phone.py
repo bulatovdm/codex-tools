@@ -470,6 +470,39 @@ class PhoneTests(unittest.TestCase):
             phone.watch_owner('test-session', 'previous-owner', phone.load_config())
         delivery.assert_not_called()
 
+    def test_window_close_of_managed_run_is_not_reported_as_crash(self):
+        run = 'a' * 32
+        managed = self.home / '.local/share/codex-tools/runs' / run
+        managed.mkdir(parents=True)
+        (managed / 'normal-close').touch()
+        directory = phone.state_directory('test-session')
+        with phone.locked(directory) as state:
+            state['owner'] = {'pid': 42, 'started': 'original', 'token': 'owner'}
+            state['managed_run'] = run
+        with patch.object(phone, 'process_identity', return_value=''), patch.object(phone.time, 'sleep'), patch.object(phone, 'delivery_worker') as delivery:
+            phone.watch_owner('test-session', 'owner', phone.load_config())
+        delivery.assert_not_called()
+        self.assertTrue(self.read_state()['ended'])
+        self.assertEqual(self.read_state().get('deliveries', {}), {})
+
+    def test_session_start_tracks_only_current_managed_run(self):
+        first = 'a' * 32
+        with patch.dict(os.environ, {'CODEX_TOOLS_RUN': first}), patch.object(phone, 'find_owner', return_value=None):
+            phone.handle(self.event('SessionStart'), phone.load_config())
+        self.assertEqual(self.read_state()['managed_run'], first)
+        with patch.dict(os.environ, {'CODEX_TOOLS_RUN': ''}), patch.object(phone, 'find_owner', return_value=None):
+            phone.handle(self.event('SessionStart'), phone.load_config())
+        self.assertNotIn('managed_run', self.read_state())
+
+    def test_direct_or_unmarked_codex_process_death_still_notifies(self):
+        directory = phone.state_directory('test-session')
+        with phone.locked(directory) as state:
+            state['owner'] = {'pid': 42, 'started': 'original', 'token': 'owner'}
+            state['managed_run'] = 'a' * 32
+        with patch.object(phone, 'process_identity', return_value=''), patch.object(phone.time, 'sleep'), patch.object(phone, 'delivery_worker') as delivery:
+            phone.watch_owner('test-session', 'owner', phone.load_config())
+        self.assertEqual(delivery.call_count, 1)
+
     def test_exit_status_notifies_failure_but_not_quit_or_ctrl_c(self):
         run = self.home / 'run'
         run.mkdir()
@@ -479,6 +512,10 @@ class PhoneTests(unittest.TestCase):
             with patch.object(phone, 'launch_delivery_worker') as launch:
                 phone.report_exit(run, code, phone.load_config())
             self.assertEqual(launch.call_count, int(code not in (0, 130, -2)))
+        (run / 'normal-close').touch()
+        with patch.object(phone, 'launch_delivery_worker') as launch:
+            phone.report_exit(run, -1, phone.load_config())
+        launch.assert_not_called()
 
     def test_normal_exit_cancels_already_queued_crash_notification(self):
         run = self.home / 'run'
