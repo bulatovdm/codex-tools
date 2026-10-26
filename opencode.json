@@ -1,0 +1,34 @@
+{
+  "mcp": {
+    "work_worker": {
+      "type": "local",
+      "command": [
+        "work-worker",
+        "mcp",
+        "--session-source",
+        "opencode",
+        "--project-root",
+        "."
+      ],
+      "enabled": true
+    }
+  },
+  "permission": {
+    "work_worker_ww_participants": "allow",
+    "work_worker:ww_participants": "allow",
+    "work_worker_ww_send": "allow",
+    "work_worker:ww_send": "allow",
+    "work_worker_ww_inbox": "allow",
+    "work_worker:ww_inbox": "allow",
+    "work_worker_ww_mark_read": "allow",
+    "work_worker:ww_mark_read": "allow",
+    "work_worker_ww_reply": "allow",
+    "work_worker:ww_reply": "allow",
+    "work_worker_ww_ack_processed": "allow",
+    "work_worker:ww_ack_processed": "allow",
+    "work_worker_ww_delivery": "allow",
+    "work_worker:ww_delivery": "allow",
+    "work_worker_ww_history": "allow",
+    "work_worker:ww_history": "allow"
+  }
+}
