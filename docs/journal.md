@@ -203,3 +203,13 @@
   source/installed bytes подтверждены. Новая метка доступна новым процессам
   wrapper, уже открытый cx загрузил прежний код и при закрытии ещё может дать
   одно ложное уведомление.
+## 2026-10-27 · имя сессии в строке tmux
+
+- Добавлено поле session_name после проекта: точный native ID → readonly
+  state_5.sqlite/threads.name, fallback последнего thread_name из session_index.
+  Чтение на каждом обновлении отображает /rename без перезапуска; чужие сессии
+  и тексты сообщений для определения имени не используются.
+- 11 целевых status tests green: смена имени между обновлениями, exact ID,
+  custom CODEX_HOME, fallback и tmux escaping. Установленный скрипт проверен
+  на реальной именованной записи каталога. Изменены только status.py и локальный
+  список fields с private backup status-session-name-20261027-123725.

@@ -1,4 +1,4 @@
 {
-  "fields": ["project", "environment", "address", "listener", "scope", "browser"],
+  "fields": ["project", "session_name", "environment", "address", "listener", "scope", "browser"],
   "separator": " · "
 }

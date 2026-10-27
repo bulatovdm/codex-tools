@@ -4,11 +4,12 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
 import sys
 import unicodedata
 import urllib.parse
 
-FIELDS = ['project', 'environment', 'address', 'listener', 'scope', 'browser']
+FIELDS = ['project', 'session_name', 'environment', 'address', 'listener', 'scope', 'browser']
 
 def clean(value):
     return ''.join(character for character in str(value) if not unicodedata.category(character).startswith('C'))[:500]
@@ -33,9 +34,48 @@ def read(path):
     except OSError:
         return ''
 
+def session_name(session, environment, home):
+    if not session:
+        return ''
+    directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
+    database = directory / 'state_5.sqlite'
+    if database.is_file():
+        connection = None
+        try:
+            connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=0.2)
+            row = connection.execute('SELECT name FROM threads WHERE id = ?', (session,)).fetchone()
+            if row and isinstance(row[0], str) and row[0].strip():
+                return row[0].strip()
+        except sqlite3.Error:
+            pass
+        finally:
+            if connection is not None:
+                connection.close()
+    name = ''
+    try:
+        with (directory / 'session_index.jsonl').open('rb') as stream:
+            stream.seek(0, 2)
+            offset = max(0, stream.tell() - 5_000_000)
+            stream.seek(offset)
+            if offset:
+                stream.readline()
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get('id') == session and isinstance(entry.get('thread_name'), str):
+                    name = entry['thread_name'].strip()
+    except OSError:
+        pass
+    return name
+
 def collect(cwd, session, environment, home):
     root = project_root(cwd)
     result = {'project': root.name}
+    name = session_name(session, environment, home)
+    if name:
+        result['session_name'] = name
     configuration = root / 'devops/project.conf'
     if configuration.is_file() and (root / 'devops/support/listeners.sh').is_file():
         values = dict(re.findall(r'^([A-Z_]+)="([^"\n]*)"\s*$', read(configuration), re.MULTILINE))

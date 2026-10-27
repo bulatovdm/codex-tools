@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import sqlite3
 import pathlib
 import tempfile
 import unittest
@@ -78,6 +79,38 @@ class StatusTests(unittest.TestCase):
         value = status.collect(self.root, '', {}, self.root)
         self.assertEqual(value['project'], self.root.name)
         self.assertNotIn('listener', value)
+
+    def test_rename_is_read_on_each_refresh_for_exact_session(self):
+        directory = self.root / '.codex'; directory.mkdir()
+        with sqlite3.connect(directory / 'state_5.sqlite') as connection:
+            connection.execute('CREATE TABLE threads (id TEXT, name TEXT)')
+            connection.executemany('INSERT INTO threads VALUES (?, ?)', [('ours', 'Моя сессия'), ('other', 'Чужая сессия')])
+            connection.commit()
+            first = status.collect(self.project, 'ours', self.environment, self.root)
+            self.assertEqual(first['session_name'], 'Моя сессия')
+            connection.execute('UPDATE threads SET name = ? WHERE id = ?', ('Новое имя', 'ours'))
+            connection.commit()
+            second = status.collect(self.project, 'ours', self.environment, self.root)
+        self.assertEqual(second['session_name'], 'Новое имя')
+        self.assertIn('Новое имя', status.render(second, {}))
+        self.assertNotIn('session_name', status.collect(self.project, '', self.environment, self.root))
+
+    def test_index_fallback_uses_latest_exact_session_name_and_custom_codex_home(self):
+        directory = self.root / 'custom'; directory.mkdir()
+        index = directory / 'session_index.jsonl'
+        index.write_text('\n'.join(json.dumps(entry) for entry in [[], {'id':'ours', 'thread_name':'Старое'},
+                         {'id':'other', 'thread_name':'Чужое'}, {'id':'ours', 'thread_name':'Переименовано'}]) + '\n')
+        environment = dict(self.environment, CODEX_HOME=str(directory))
+        self.assertEqual(status.collect(self.project, 'ours', environment, self.root)['session_name'], 'Переименовано')
+
+    def test_session_name_is_safe_for_tmux_and_can_be_hidden(self):
+        value = {'project':'project', 'session_name':'Моё имя\n\033#[fg=red]'}
+        rendered = status.render(value, {}, tmux=True)
+        self.assertIn('Моё имя', rendered)
+        self.assertIn('##[', rendered)
+        self.assertNotIn('\033', rendered)
+        self.assertNotIn('\n', rendered)
+        self.assertEqual(status.render(value, {'fields':['project']}), 'project')
 
     def test_new_run_does_not_inherit_parent_codex_session(self):
         run = 'a' * 32
