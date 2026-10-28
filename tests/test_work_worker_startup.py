@@ -19,7 +19,7 @@ class Terminal(io.StringIO):
     def isatty(self):return True
 
 class WorkWorkerStartupTests(unittest.TestCase):
-    def test_connected_empty_run_records_a_fixed_prompt_for_the_native_launch(self):
+    def test_connected_empty_run_without_app_server_records_the_fallback_prompt(self):
         with tempfile.TemporaryDirectory() as d:
             home=Path(d);(home/'.local/bin').mkdir(parents=True);(home/'.local/bin/codex').touch()
             captured={}
@@ -31,7 +31,7 @@ class WorkWorkerStartupTests(unittest.TestCase):
                 run=next((home/'.local/share/codex-tools/runs').iterdir())
                 captured.update(json.loads((run/'launch.json').read_text()))
                 (run/'exit-code').write_text('0');return 0
-            with patch.dict(os.environ,{'WORK_WORKER_HOME':'/fixture/explicit-runtime'}),patch.object(Path,'home',return_value=home),patch.object(launcher.os,'getcwd',return_value=str(home)),patch.object(launcher,'tmux_path',return_value='/fixture/tmux'),patch.object(launcher.shutil,'which',return_value='/fixture/work-worker'),patch.object(sys,'stdin',Terminal()),contextlib.redirect_stdout(Terminal()),patch.object(launcher.subprocess,'run',side_effect=command),patch.object(launcher.subprocess,'call',side_effect=attach):
+            with patch.dict(os.environ,{'WORK_WORKER_HOME':'/fixture/explicit-runtime'}),patch.object(Path,'home',return_value=home),patch.object(launcher.os,'getcwd',return_value=str(home)),patch.object(launcher,'tmux_path',return_value='/fixture/tmux'),patch.object(launcher.shutil,'which',return_value='/fixture/work-worker'),patch.object(sys,'stdin',Terminal()),contextlib.redirect_stdout(Terminal()),patch.object(launcher.subprocess,'run',side_effect=command),patch.object(launcher.subprocess,'call',side_effect=attach),patch.object(launcher,'create_native_thread',return_value=None):
                 self.assertEqual(launcher.run([]),0)
             self.assertTrue(captured['args'],'connected empty launch must initialize without manual input')
             self.assertEqual(captured['args'],['--',launcher.WORK_WORKER_STARTUP_PROMPT])
@@ -42,8 +42,9 @@ class WorkWorkerStartupTests(unittest.TestCase):
     def invoke(self,args,cwd,response=None,error=None,executable='/fixture/work-worker'):
         if response is None:response={'version':1,'enabled':True,'project_root':str(cwd)}
         result=subprocess.CompletedProcess([],0,json.dumps(response),'')
-        with patch.object(launcher.shutil,'which',return_value=executable),patch.object(launcher.subprocess,'run',return_value=result,side_effect=error) as query:
-            actual=launcher.startup_arguments(args,str(cwd))
+        with patch.object(launcher.shutil,'which',return_value=executable),patch.object(launcher.subprocess,'run',return_value=result,side_effect=error) as query,patch.object(launcher,'create_native_thread',return_value=None):
+            actual,native=launcher.startup_arguments(args,str(cwd))
+        self.assertIsNone(native,'only a prepared thread yields an identity')
         return actual,query
 
     def test_selected_directory_and_model_are_preserved(self):
@@ -84,11 +85,11 @@ class WorkWorkerStartupTests(unittest.TestCase):
 
     def test_directory_resolution_failure_keeps_the_optional_feature_from_blocking_codex(self):
         with patch.object(launcher.pathlib.Path,'resolve',side_effect=OSError('unavailable directory')):
-            self.assertEqual(launcher.startup_arguments([],os.getcwd()),[])
+            self.assertEqual(launcher.startup_arguments([],os.getcwd()),([],None))
 
     def test_explicit_client_error_and_non_json_query_do_not_block_codex(self):
         for result in [subprocess.CompletedProcess([],2,'','unsupported command'),subprocess.CompletedProcess([],0,'not json','')]:
             with patch.object(launcher.shutil,'which',return_value='/fixture/work-worker'),patch.object(launcher.subprocess,'run',return_value=result):
-                self.assertEqual(launcher.startup_arguments([],os.getcwd()),[])
+                self.assertEqual(launcher.startup_arguments([],os.getcwd()),([],None))
 
 if __name__=='__main__':unittest.main()

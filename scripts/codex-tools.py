@@ -10,6 +10,9 @@ import uuid
 import re
 import sqlite3
 import signal
+import time
+import datetime
+import threading
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -20,14 +23,63 @@ WORK_WORKER_STARTUP_PROMPT = (
 )
 
 
-def startup_arguments(arguments, cwd):
+def create_native_thread(cli, cwd, name, timeout=10):
+    """Ask Codex for a new thread without a model turn; None keeps the old path.
+
+    Only a named thread is written to disk, so the name makes it resumable.
+    """
+    deadline = time.monotonic() + timeout
     try:
-        return _startup_arguments(arguments, cwd)
+        process = subprocess.Popen([cli, 'app-server'], cwd=cwd, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return None
+    timer = None
+    try:
+        timer = threading.Timer(timeout, process.kill)
+        timer.start()
+
+        def call(identifier, method, params):
+            process.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': identifier, 'method': method, 'params': params}) + '\n')
+            process.stdin.flush()
+            while time.monotonic() < deadline:
+                line = process.stdout.readline()
+                if not line:
+                    return None
+                message = json.loads(line)
+                if message.get('id') == identifier:
+                    return None if 'error' in message else message.get('result')
+            return None
+
+        if call(1, 'initialize', {'clientInfo': {'name': 'codex-tools', 'version': '1'}}) is None:
+            return None
+        process.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'initialized'}) + '\n')
+        process.stdin.flush()
+        started = call(2, 'thread/start', {'cwd': cwd, 'sessionStartSource': 'startup'})
+        native = ((started or {}).get('thread') or {}).get('id')
+        if not isinstance(native, str) or str(uuid.UUID(native)) != native.lower():
+            return None
+        if call(3, 'thread/name/set', {'threadId': native, 'name': name}) is None:
+            return None
+        return native.lower()
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    finally:
+        if timer:
+            timer.cancel()
+        process.kill()
+        process.wait()
+
+
+def startup_arguments(arguments, cwd, cli=None):
+    """Return (arguments, native); native is a Codex-issued ID known before launch."""
+    try:
+        return _startup_arguments(arguments, cwd, cli)
     except (OSError, RuntimeError):
-        return arguments
+        return arguments, None
 
 
-def _startup_arguments(arguments, cwd):
+def _startup_arguments(arguments, cwd, cli=None):
     # Recognize only empty native launches whose argument meaning is known. All
     # prompts, subcommands, config/profile overrides and future flags pass through.
     selected = pathlib.Path(cwd).resolve()
@@ -38,38 +90,43 @@ def _startup_arguments(arguments, cwd):
         arg = arguments[index]
         if arg in valued:
             if index + 1 >= len(arguments) or arguments[index + 1].startswith('-'):
-                return arguments
+                return arguments, None
             if arg in {'-C', '--cd'}:
                 selected = (pathlib.Path(cwd) / arguments[index + 1]).resolve()
             index += 2
         elif any(arg.startswith(option + '=') for option in valued if option.startswith('--')):
             option, value = arg.split('=', 1)
             if not value:
-                return arguments
+                return arguments, None
             if option == '--cd':
                 selected = (pathlib.Path(cwd) / value).resolve()
             index += 1
         elif arg in flags:
             index += 1
         else:
-            return arguments
+            return arguments, None
     executable = shutil.which('work-worker')
     if not executable:
-        return arguments
+        return arguments, None
     try:
         result = subprocess.run([executable, 'startup-context'], cwd=str(selected),
                                 capture_output=True, text=True, timeout=1.5)
         if result.returncode != 0 or len(result.stdout) > 4096:
-            return arguments
+            return arguments, None
         context = json.loads(result.stdout)
         if not isinstance(context, dict) or context.get('version') != 1 or context.get('enabled') is not True:
-            return arguments
+            return arguments, None
         root = pathlib.Path(context['project_root'])
         if not root.is_absolute() or not selected.is_relative_to(root.resolve()):
-            return arguments
+            return arguments, None
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-        return arguments
-    return [*arguments, '--', WORK_WORKER_STARTUP_PROMPT]
+        return arguments, None
+    # Prefer a prepared thread: the session is addressable without a model turn.
+    name = root.name + ' ' + datetime.datetime.now().strftime('%m-%d %H:%M')
+    native = create_native_thread(cli or str(pathlib.Path.home() / '.local/bin/codex'), str(selected), name, 10)
+    if native:
+        return ['resume', *arguments, native], native
+    return [*arguments, '--', WORK_WORKER_STARTUP_PROMPT], None
 
 
 def tmux_path():
@@ -231,6 +288,38 @@ def resume_request(arguments, cwd):
             request['overrides'] = True
         index += 1
     return request if found else None
+
+
+def known_thread(native):
+    """True when the native catalog has a resumable thread with this exact ID."""
+    database = pathlib.Path(os.environ.get('CODEX_HOME', str(pathlib.Path.home() / '.codex'))) / 'state_5.sqlite'
+    try:
+        if not database.is_file():
+            return False
+        with sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=0.5) as connection:
+            row = connection.execute('SELECT rollout_path FROM threads WHERE id = ? AND archived = 0',
+                                     (native,)).fetchone()
+        return bool(row) and isinstance(row[0], str) and pathlib.Path(row[0]).is_file()
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def resume_identity(arguments, cwd):
+    """Exact saved thread a resume launch will open, or None for picker/name/--last."""
+    request = resume_request(arguments, cwd)
+    target = request and request['target']
+    if not target or request['last'] or not re.fullmatch(
+            r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', target):
+        return None
+    native = target.lower()
+    return (native, request['cwd']) if known_thread(native) else None
+
+
+def record_identity(directory, native, cwd):
+    """Write the Codex-issued identity the session hook would later record."""
+    descriptor = os.open(directory / 'session.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w') as output:
+        json.dump({'session_id': native, 'cwd': cwd}, output)
 
 
 def run_titles(runs):
@@ -467,7 +556,15 @@ def run(arguments):
     if not cli.exists():
         raise RuntimeError('Codex CLI is missing: ' + str(cli))
     environment = {key: value for key, value in os.environ.items() if key in ['EMPIRIKA_BASE_URL', 'EMPIRIKA_EVENT_PROJECT', 'EMPIRIKA_EVENT_ASSET', 'EMPIRIKA_LISTENERS_DIR', 'WORK_WORKER_HOME']}
-    arguments = startup_arguments(arguments, os.getcwd())
+    arguments, native = startup_arguments(arguments, os.getcwd(), str(cli))
+    identity_cwd = os.getcwd()
+    if native is None:
+        known = resume_identity(arguments, os.getcwd())
+        if known:
+            native, identity_cwd = known
+    if native:
+        # Work Worker can address the session before its first turn.
+        record_identity(directory, native, identity_cwd)
     launch = {'cwd': os.getcwd(), 'args': arguments, 'cli': str(cli), 'environment': environment}
     descriptor = os.open(directory / 'launch.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, 'w') as output:
