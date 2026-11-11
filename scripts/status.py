@@ -5,7 +5,10 @@ import os
 import pathlib
 import re
 import sqlite3
+import shutil
+import subprocess
 import sys
+import time
 import unicodedata
 import urllib.parse
 
@@ -70,6 +73,329 @@ def session_name(session, environment, home):
         pass
     return name
 
+class AgentStyle(str):
+    def __new__(cls, value, native, running=False):
+        item = super().__new__(cls, value)
+        item.native = native
+        item.running = running
+        return item
+
+def agent_overview(session, environment, home, structured=False, selected=None, show_selection=False):
+    """Read only explicit spawn edges and persisted turn states, never messages."""
+    if not session:
+        return ''
+    directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
+    connection = history = None
+    try:
+        connection = sqlite3.connect((directory / 'state_5.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2)
+        root = session
+        seen = set()
+        for _ in range(32):
+            if root in seen:
+                return 'Агенты: данные недоступны'
+            seen.add(root)
+            parent = connection.execute('SELECT parent_thread_id FROM thread_spawn_edges WHERE child_thread_id = ?', (root,)).fetchone()
+            if not parent:
+                break
+            root = parent[0]
+        else:
+            return 'Агенты: данные недоступны'
+        name = connection.execute('SELECT name FROM threads WHERE id = ?', (root,)).fetchone()
+        if not name:
+            return ''
+        label = name[0] or 'Без названия'
+        navigation = [('⌥←/→: переключить · /subagents: список', False)] if show_selection else []
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+        order = 't.created_at_ms, t.id' if 'created_at_ms' in columns else 't.created_at, t.id' if 'created_at' in columns else 't.rowid'
+        children = connection.execute('''WITH RECURSIVE family(id) AS (
+            SELECT ? UNION SELECT e.child_thread_id FROM thread_spawn_edges e JOIN family f ON e.parent_thread_id = f.id
+        ) SELECT t.id, t.agent_nickname, t.name, e.status FROM family f
+          JOIN threads t ON t.id = f.id JOIN thread_spawn_edges e ON e.child_thread_id = t.id
+          WHERE t.id != ? ORDER BY ''' + order + ' LIMIT 128', (root, root)).fetchall()
+        selected = resolve_visible_agent(selected, [root] + [child[0] for child in children])
+        main_part = (('▶ ' if selected == root else '') + 'Основной: ' + label,
+                     AgentStyle('selected' if selected == root else 'main', root))
+        if not children:
+            parts = [main_part] + navigation + [('Субагенты: нет', False)]
+            if show_selection and selected != root:
+                parts.append(('Выбранный: неизвестен; /statusline → thread-id', False))
+            return parts if structured else ' · '.join(text for text, _ in parts)
+        try:
+            history = sqlite3.connect((directory / 'thread_history_1.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2)
+        except sqlite3.Error:
+            pass
+        active = []
+        closed = 0
+        states = {'inProgress': 'работает', 'completed': 'готов', 'failed': 'ошибка', 'interrupted': 'прерван'}
+        for native, nickname, title, edge in children:
+            if edge == 'closed':
+                closed += 1
+                active.append(('закрыт', nickname or title or 'Без названия', native))
+                continue
+            status = None
+            if history is not None:
+                try:
+                    row = history.execute('SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1', (native,)).fetchone()
+                    status = row[0] if row else None
+                except sqlite3.Error:
+                    pass
+            active.append((states.get(status, 'статус неизвестен'), nickname or title or 'Без названия', native))
+        parts = [main_part] + navigation
+        parts.extend((('▶ ' if selected == native else '') + name + ' — ' + state,
+                      AgentStyle('selected' if selected == native else 'working' if state == 'работает' else 'closed' if state == 'закрыт' else '', native,
+                                 running=state == 'работает')) for state, name, native in active)
+        if show_selection and selected not in {root, *(native for _, _, native in active)}:
+            parts.insert(1, ('Выбранный: неизвестен; /statusline → thread-id', False))
+        if closed:
+            parts.append(('закрыты: ' + str(closed), False))
+        return parts if structured else ' · '.join(text for text, _ in parts)
+    except (OSError, ValueError, sqlite3.Error):
+        return 'Агенты: данные недоступны'
+    finally:
+        if history is not None:
+            history.close()
+        if connection is not None:
+            connection.close()
+
+def cell_width(text):
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
+
+def session_metrics(session, environment, home, run=None):
+    """Use only persisted token metadata; never infer current quota after a reset."""
+    cache = None
+    if run and re.fullmatch(r'[a-f0-9]{32}', run):
+        cache = home / '.local/share/codex-tools/runs' / run / 'panel-metrics.json'
+        try:
+            saved = json.loads(cache.read_text())
+            if saved.get('format') == 3 and saved.get('session') == session and 0 <= time.time() - saved.get('at', 0) < 30:
+                return saved.get('text', '')
+        except (OSError, ValueError, TypeError):
+            pass
+    text = ''
+    directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
+    connection = None
+    try:
+        connection = sqlite3.connect((directory / 'state_5.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2)
+        columns = {item[1] for item in connection.execute('PRAGMA table_info(threads)')}
+        model_column = 'model' if 'model' in columns else 'NULL'
+        effort_column = 'reasoning_effort' if 'reasoning_effort' in columns else 'NULL'
+        row = connection.execute('SELECT rollout_path, ' + model_column + ', ' + effort_column + ' FROM threads WHERE id = ?', (session,)).fetchone()
+        if row:
+            with pathlib.Path(row[0]).open('rb') as stream:
+                stream.seek(0, 2)
+                start = max(0, stream.tell() - 1_500_000)
+                stream.seek(start)
+                if start: stream.readline()
+                lines = stream.readlines()
+            info = rates = None
+            for raw in reversed(lines):
+                try: event = json.loads(raw)
+                except ValueError: continue
+                if not isinstance(event, dict): continue
+                payload = event.get('payload')
+                if event.get('type') != 'event_msg' or not isinstance(payload, dict) or payload.get('type') != 'token_count':
+                    continue
+                if info is None and isinstance(payload.get('info'), dict): info = payload['info']
+                if rates is None and isinstance(payload.get('rate_limits'), dict): rates = payload['rate_limits']
+                if info is not None and rates is not None: break
+            info, rates = info or {}, rates or {}
+            usage = (info.get('last_token_usage') or {}).get('total_tokens')
+            window = info.get('model_context_window')
+            model = clean(row[1]) if isinstance(row[1], str) else ''
+            effort = clean(row[2]) if isinstance(row[2], str) else ''
+            parts = [' '.join(value for value in (model, effort) if value)] if model or effort else []
+            if isinstance(usage, (int, float)) and isinstance(window, (int, float)) and window > 0:
+                parts.append('контекст: ' + str(round(usage / 1000)) + 'K / ' + str(round(window / 1000)) + 'K')
+            for key in ('primary', 'secondary'):
+                rate = rates.get(key) or {}
+                used, minutes = rate.get('used_percent'), rate.get('window_minutes')
+                if not isinstance(used, (int, float)) or not isinstance(minutes, int): continue
+                label = 'неделя' if minutes == 10080 else '5ч' if minutes == 300 else str(minutes) + 'мин'
+                reset = rate.get('resets_at')
+                value = 'ожидает данных' if isinstance(reset, (int, float)) and reset <= time.time() else str(round(max(0, min(100, 100 - used)))) + '% осталось'
+                parts.append(label + ': ' + value)
+            text = ' · '.join(parts) if parts else ''
+    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
+        pass
+    finally:
+        if connection is not None: connection.close()
+    if cache is not None:
+        temporary = cache.with_name(cache.name + '.' + str(os.getpid()))
+        try:
+            temporary.write_text(json.dumps({'format': 3, 'session': session, 'at': time.time(), 'text': text}, ensure_ascii=False))
+            temporary.chmod(0o600)
+            os.replace(temporary, cache)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+    return text
+
+def agent_rows(overview, width, tmux=False, max_rows=4):
+    """Wrap whole entries where possible; keep trusted styles apart from names."""
+    width = max(16, min(width, 1000))
+    capacity = width - cell_width(' АГЕНТЫ │ ')
+    entries = overview if isinstance(overview, list) else [(overview, False)]
+    rows = [[]]
+    used = 0
+    for text, working in entries:
+        text = clean(text)
+        if not text:
+            continue
+        if used and used + 3 + cell_width(text) > capacity:
+            rows.append([]); used = 0
+        if used:
+            rows[-1].append((' · ', False)); used += 3
+        for char in text:
+            size = cell_width(char)
+            if used + size > capacity:
+                rows.append([]); used = 0
+            rows[-1].append((char, working)); used += size
+    if len(rows) > max_rows:
+        rows = rows[:max_rows]
+        while rows[-1] and sum(cell_width(text) for text, _ in rows[-1]) + cell_width(' · …') > capacity:
+            rows[-1].pop()
+        rows[-1].append((' · …', False))
+    rendered = []
+    for index, row in enumerate(rows):
+        prefix = ' АГЕНТЫ │ ' if index == 0 else '        │ '
+        if not tmux:
+            rendered.append(prefix + ''.join(text for text, _ in row))
+            continue
+        result = '#[bg=colour236,fg=colour250,bold]' + prefix
+        previous = None
+        for text, working in row:
+            if working != previous:
+                result += ('#[bg=colour238,fg=colour229,bold]' if working == 'selected' else
+                           '#[bg=colour236,fg=colour255,bold]' if working == 'main' else
+                           '#[bg=colour236,fg=colour244,nobold]' if working == 'closed' else
+                           '#[bg=colour236,fg=colour117,bold]' if working else '#[bg=colour236,fg=colour255,nobold]')
+                previous = working
+            result += text.replace('#', '##')
+        result += '#[norange,bg=colour236,fg=colour255,nobold]'
+        rendered.append(result)
+    return rendered
+
+def agent_panel_rows(overview, width, tmux=False, metrics=""):
+    """One compact agent row, padding around the group, and a shared info row."""
+    width = max(16, min(width, 1000))
+    def clip(text, limit):
+        result = ''
+        for char in clean(text):
+            if cell_width(result + char) > limit: break
+            result += char
+        return result
+    symbols = {'работает': '●', 'готов': '✓', 'закрыт': '×',
+               'ошибка': '!', 'прерван': '■', 'статус неизвестен': '?'}
+    entries = overview if isinstance(overview, list) else [(overview, False)]
+    items = []
+    selected = ''
+    for text, style in entries:
+        text = clean(text)
+        if isinstance(overview, list) and not isinstance(style, AgentStyle) and style not in ('main', 'selected', 'working', 'closed', ''):
+            continue
+        if style == 'selected': selected = text.removeprefix('▶ ').split(' — ')[0]
+        name, separator, state = text.rpartition(' — ')
+        if separator and state in symbols: text = name + ' ' + symbols[state]
+        if text: items.append((text, style))
+    capacity = width - 4
+    shown = []
+    used = 0
+    for index, (text, style) in enumerate(items):
+        gap = 3 if shown else 0
+        reserve = 4 if index < len(items) - 1 else 0
+        if shown and used + gap + cell_width(text) + reserve > capacity: break
+        text = clip(text, capacity - used - gap - reserve)
+        if shown: shown.append((' · ', False)); used += gap
+        shown.append((text, style)); used += cell_width(text)
+    # Entries with an unknown state may have an empty style; count actual entries separately.
+    displayed = sum(text != ' · ' for text, _ in shown)
+    if displayed < len(items): shown.append((' · …', False)); used += 4
+    def styled(text, style):
+        if not tmux: return text
+        colors = ('bg=colour238,fg=colour229,bold' if style == 'selected' else
+                  'bg=colour237,fg=colour255,bold' if style == 'main' else
+                  'bg=colour237,fg=colour117,bold' if style == 'working' else
+                  'bg=colour237,fg=colour245,nobold' if style == 'closed' else
+                  'bg=colour237,fg=colour250,nobold' if style is not False else
+                  'bg=colour236,fg=colour250,nobold')
+        return '#[' + colors + ']' + text.replace('#', '##')
+    blank = styled(' ' * width, False)
+    line = styled('  ', False) + ''.join(styled(text, style) for text, style in shown)
+    line += styled(' ' * max(2, width - 2 - used), False)
+    data = clean(metrics)
+    for old, new in [('Выбранный · ', ''), ('Основной · ', ''), ('посл. данные · ', ''),
+                     ('снимок · ', ''), (' / ', '/')]:
+        data = data.replace(old, new)
+    who = ('Сейчас: ' + ('основной' if selected.startswith('Основной:') else clip(selected, 20))) if selected else 'Выбор: Codex'
+    if not selected and data: who = ''
+    controls = ' /subagents · ⌥←/→ ' if width >= 100 else ' /subagents '
+    available = max(0, width - cell_width(controls))
+    info = clip(' ' + ' · '.join(part for part in (who, data) if part), available)
+    info += ' ' * max(0, available - cell_width(info)) + clip(controls, width - cell_width(info))
+    if tmux: info = '#[bg=colour234,fg=colour248,nobold]' + info.replace('#', '##')
+    return [blank, line, blank, info]
+
+def footer_thread_id(text):
+    # Native footer may put thread-id last and truncate it to the available width.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(reversed(lines[-3:])):
+        match = re.fullmatch(r'([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?:\s+·.*)?', line)
+        if match and (index == 0 or ' · ' in line):
+            return match[1]
+        if not any(marker in line for marker in ('Context ', 'weekly ', 'window', ' · ')) or line.startswith(('›', '•')):
+            continue
+        match = re.search(r'(?:^| · )([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})(?= · |$)', line)
+        if match:
+            return match[1]
+        match = re.search(r'(?:^| · )([0-9a-f]{8}-[0-9a-f-]{9,26})…$', line)
+        if match and len(match[1].replace('-', '')) >= 16:
+            return match[1] + '…'
+    return None
+
+def resolve_visible_agent(selected, family):
+    if not isinstance(selected, str):
+        return None
+    if selected.endswith('…'):
+        matches = [native for native in set(family) if native.startswith(selected[:-1])]
+        return matches[0] if len(matches) == 1 else None
+    return selected if selected in family else None
+
+def visible_agent(run, home):
+    if not re.fullmatch(r'[a-f0-9]{32}', run):
+        return None
+    executable = home / '.local/share/codex-tools/tmux/bin/tmux'
+    tmux = str(executable) if executable.is_file() else shutil.which('tmux')
+    if not tmux:
+        return None
+    prefix = [tmux, '-L', 'codex-tools-' + run, '-f', '/dev/null']
+    try:
+        size = subprocess.run([*prefix, 'display-message', '-p', '-t', 'codex', '#{pane_height} #{cursor_y}'], capture_output=True, text=True, timeout=1)
+        fields = size.stdout.strip().split()
+        if size.returncode or len(fields) != 2 or not all(field.isdigit() for field in fields):
+            return None
+        height, cursor = map(int, fields)
+        captured = subprocess.run([*prefix, 'capture-pane', '-p', '-t', 'codex', '-S', str(max(0, min(cursor, height - 8))), '-E', str(height - 1)],
+                                  capture_output=True, text=True, timeout=1)
+        return footer_thread_id(captured.stdout) if captured.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+def update_agent_height(run, row_count, home):
+    if not re.fullmatch(r'[a-f0-9]{32}', run):
+        return
+    installed = home / '.local/share/codex-tools/tmux/bin/tmux'
+    tmux = str(installed) if installed.is_file() else shutil.which('tmux')
+    if not tmux:
+        return
+    prefix = [tmux, '-L', 'codex-tools-' + run, '-f', '/dev/null']
+    desired = str(1 + max(1, min(4, row_count)))
+    try:
+        current = subprocess.run([*prefix, 'show-options', '-gv', 'status'], capture_output=True, text=True, timeout=1)
+        if current.returncode == 0 and current.stdout.strip() != desired:
+            subprocess.run([*prefix, 'set-option', '-g', 'status', desired],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
 def collect(cwd, session, environment, home):
     root = project_root(cwd)
     result = {'project': root.name}
@@ -102,7 +428,9 @@ def collect(cwd, session, environment, home):
     if guard.exists():
         try:
             health = json.loads(guard.read_text())
-            result['browser'] = 'браузер: CLI проверен' if health.get('healthy') else 'браузер: ошибка сторожа'
+            result['browser'] = ('браузер: CLI проверен' if health.get('healthy') else
+                                 'проверка браузера: требует обновления' if 'Unsupported cua_repl launcher' in str(health.get('error', '')) else
+                                 'браузер: нужна проверка подключения')
         except (ValueError, OSError):
             result['browser'] = 'браузер: статус неизвестен'
     return result
@@ -121,6 +449,9 @@ def main():
     parser.add_argument('--run')
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--tmux', action='store_true')
+    parser.add_argument('--agents', action='store_true')
+    parser.add_argument('--agent-row', type=int)
+    parser.add_argument('--width', type=int, default=120)
     args = parser.parse_args()
     home = pathlib.Path.home()
     environment = dict(os.environ)
@@ -138,6 +469,22 @@ def main():
             args.cwd = session.get('cwd') or args.cwd
     settings = home / '.config/codex-tools/status.json'
     options = json.loads(settings.read_text()) if settings.exists() else {}
+    if args.agents:
+        if args.agent_row is not None:
+            selected = visible_agent(args.run, home) if args.run else None
+            overview = agent_overview(args.session, environment, home, structured=True, selected=selected)
+            chosen = next((style.native for _, style in overview if isinstance(style, AgentStyle) and style == 'selected'), None) if isinstance(overview, list) else None
+            root = next((style.native for _, style in overview if isinstance(style, AgentStyle) and style in ('main', 'selected')), args.session) if isinstance(overview, list) else args.session
+            metrics = session_metrics(chosen or root, environment, home, args.run)
+            label = ' Выбранный' if chosen else ' Основной'
+            rows = agent_panel_rows(overview, args.width, args.tmux, label + ' · ' + metrics if metrics else '')
+            if args.agent_row == 0 and args.tmux and args.run:
+                update_agent_height(args.run, len(rows), home)
+            print(rows[args.agent_row] if 0 <= args.agent_row < len(rows) else '#[bg=colour236]' if args.tmux else '')
+        else:
+            text = clean(agent_overview(args.session, environment, home))
+            print(text.replace('#', '##') if args.tmux else text)
+        return
     value = collect(args.cwd, args.session, environment, home)
     print(json.dumps(value, ensure_ascii=False) if args.json else render(value, options, args.tmux))
 

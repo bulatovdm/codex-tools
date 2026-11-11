@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Панель агентов — макет для согласования</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 24px; background: #f1f1ef; color: #252525; font: 15px/1.5 system-ui, sans-serif; }
+  h1 { margin: 0 0 8px; font-size: 22px; }
+  p { margin: 8px 0 18px; max-width: 850px; }
+  .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px; margin: 20px 0; }
+  label { display: inline-flex; align-items: center; gap: 8px; }
+  select { font: inherit; padding: 5px 8px; }
+  .viewport { overflow-x: auto; padding-bottom: 12px; }
+  .terminal { --columns: 120; width: calc(var(--columns) * 1ch); font: 14px/22px Menlo, Consolas, "Liberation Mono", monospace; font-variant-ligatures: none; letter-spacing: 0; }
+  .line { white-space: pre; height: 22px; overflow: hidden; }
+  .ruler { color: #777; background: #e5e5e2; }
+  .context { background: #fafafa; color: #454545; }
+  .prompt { background: #ebebeb; color: #222; }
+  .project { background: #262626; color: #bcbcbc; }
+  [id$="-agent-rows"] { background: #303030; padding: 22px 2ch; }
+  .agents { background: #303030; color: #bcbcbc; }
+  .prefix { color: #bcbcbc; font-weight: 700; }
+  .block { background: #3a3a3a; color: #eee; padding: 0; margin: 0; }
+  .flat .block:not(.selected) { background: transparent; }
+  .variant { margin: 28px 0; }
+  .variant h2 { font-size: 18px; margin: 0 0 8px; }
+  .block.main { font-weight: 700; }
+  .block.working { color: #87d7ff; font-weight: 700; }
+  .block.closed { color: #9e9e9e; }
+  .block.selected { background: #444444; color: #ffffaf; font-weight: 700; }
+  .gap { background: #303030; color: #a3a3a3; }
+  .metrics { background: #262626; color: #bcbcbc; }
+  .help { background: #1c1c1c; color: #a8a8a8; }
+  .legend { display: flex; gap: 10px 24px; flex-wrap: wrap; margin-top: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 14px; height: 14px; display: inline-block; background: #303030; }
+  .swatch.working { background: #87d7ff; }
+  .swatch.selected { background: #ffffaf; }
+  .swatch.closed { background: #9e9e9e; }
+  .result { margin-top: 14px; font-weight: 600; }
+  .note { color: #585858; }
+</style>
+</head>
+<body>
+<h1>Четыре варианта общего блока агентов</h1>
+<p>Макет для согласования. У общего тёмно-серого блока — одна пустая строка сверху и снизу, два символа свободного места слева и справа. У отдельных агентов нет внутренних отступов — фон начинается и заканчивается вместе с текстом. Все четыре варианта показаны ниже одновременно. Данные приведены для примера.</p>
+<div class="controls">
+  <label>Ширина терминала
+    <select id="columns"><option>80</option><option selected>120</option><option>160</option><option>200</option></select>
+  </label>
+  <label>Пример
+    <select id="count"><option value="5">5 потоков</option><option value="12" selected>12 потоков</option></select>
+  </label>
+  <label>Выбранный поток
+    <select id="selected"><option value="main">Основной</option><option value="nash" selected>Nash</option><option value="arendt">Arendt — закрыт</option></select>
+  </label>
+  <label><input id="spaces" type="checkbox"> Показать пробелы точками</label>
+</div>
+<section class="variant"><h2>Плашки по размеру текста</h2><div class="viewport">
+  <div class="terminal " id="tiles-terminal" aria-label="Пример нижней области терминала">
+    <div class="line ruler" id="tiles-ruler" aria-hidden="true"></div>
+    <div class="line context"> • Working · esc to interrupt</div>
+    <div class="line prompt"> › Ask Codex to do anything</div>
+    <div class="line context"> GPT-6.1-Sol · Context 40% used · ← for agents</div>
+    <div class="line project"> codex-tools · development · браузер: CLI проверен</div>
+    <div id="tiles-agent-rows"></div>
+    <div id="tiles-metric-rows"></div>
+    <div class="line help" id="tiles-help"></div>
+  </div>
+</div>
+<p class="note" id="tiles-summary"></p></section>
+<section class="variant"><h2>Вертикальные разделители</h2><div class="viewport">
+  <div class="terminal flat" id="dividers-terminal" aria-label="Пример нижней области терминала">
+    <div class="line ruler" id="dividers-ruler" aria-hidden="true"></div>
+    <div class="line context"> • Working · esc to interrupt</div>
+    <div class="line prompt"> › Ask Codex to do anything</div>
+    <div class="line context"> GPT-6.1-Sol · Context 40% used · ← for agents</div>
+    <div class="line project"> codex-tools · development · браузер: CLI проверен</div>
+    <div id="dividers-agent-rows"></div>
+    <div id="dividers-metric-rows"></div>
+    <div class="line help" id="dividers-help"></div>
+  </div>
+</div>
+<p class="note" id="dividers-summary"></p></section>
+<section class="variant"><h2>Квадратные скобки</h2><div class="viewport">
+  <div class="terminal flat" id="brackets-terminal" aria-label="Пример нижней области терминала">
+    <div class="line ruler" id="brackets-ruler" aria-hidden="true"></div>
+    <div class="line context"> • Working · esc to interrupt</div>
+    <div class="line prompt"> › Ask Codex to do anything</div>
+    <div class="line context"> GPT-6.1-Sol · Context 40% used · ← for agents</div>
+    <div class="line project"> codex-tools · development · браузер: CLI проверен</div>
+    <div id="brackets-agent-rows"></div>
+    <div id="brackets-metric-rows"></div>
+    <div class="line help" id="brackets-help"></div>
+  </div>
+</div>
+<p class="note" id="brackets-summary"></p></section>
+<section class="variant"><h2>Компактные имена со значками</h2><div class="viewport">
+  <div class="terminal " id="compact-terminal" aria-label="Пример нижней области терминала">
+    <div class="line ruler" id="compact-ruler" aria-hidden="true"></div>
+    <div class="line context"> • Working · esc to interrupt</div>
+    <div class="line prompt"> › Ask Codex to do anything</div>
+    <div class="line context"> GPT-6.1-Sol · Context 40% used · ← for agents</div>
+    <div class="line project"> codex-tools · development · браузер: CLI проверен</div>
+    <div id="compact-agent-rows"></div>
+    <div id="compact-metric-rows"></div>
+    <div class="line help" id="compact-help"></div>
+  </div>
+</div>
+<p class="note" id="compact-summary"></p></section>
+<div class="legend">
+  <span><i class="swatch working" aria-hidden="true"></i>Работает</span>
+  <span><i class="swatch selected" aria-hidden="true"></i>Выбран сейчас — ▶</span>
+  <span><i class="swatch closed" aria-hidden="true"></i>Закрыт</span>
+  <span>Основной поток — жирный</span>
+</div>
+<p class="result" id="result" aria-live="polite"></p>
+<p class="note">Блоки здесь информационные: клик по ним не переключает Codex. Для выбранного потока предусмотрена подсветка, когда его ID доступен панели. Горизонтальная прокрутка сохраняет настоящий размер символов, если окно браузера уже выбранной ширины.</p>
+<p class="note">Вертикальные отступы добавляют две строки высоты. В текущей status-панели tmux доступно пять строк: для применения такого оформления потребуется компактнее разместить служебную информацию либо выделить панели отдельную область. Здесь показан желаемый дизайн без скрытого сжатия.</p>
+<p class="note">Это проект оформления. Рабочая панель остаётся прежней до утверждения.</p>
+<script>
+(() => {
+  const agents = [
+    {id:'main', name:'Основной: development', state:'', kind:'main'},
+    {id:'pascal', name:'Pascal', state:'работает', kind:'working'},
+    {id:'nash', name:'Nash', state:'работает', kind:'working'},
+    {id:'ramanujan', name:'Ramanujan', state:'готов', kind:''},
+    {id:'arendt', name:'Arendt', state:'закрыт', kind:'closed'},
+    {id:'heisenberg', name:'Heisenberg', state:'работает', kind:'working'},
+    {id:'avicenna', name:'Avicenna', state:'готов', kind:''},
+    {id:'franklin', name:'Franklin', state:'готов', kind:''},
+    {id:'gauss', name:'Gauss', state:'закрыт', kind:'closed'},
+    {id:'hume', name:'Hume', state:'готов', kind:''},
+    {id:'jason', name:'Jason', state:'готов', kind:''},
+    {id:'planck', name:'Planck', state:'готов', kind:''}
+  ];
+  const $ = id => document.getElementById(id);
+  const prefix = ' АГЕНТЫ │ ';
+  const continuation = '        │ ';
+  const cellWidth = text => Array.from(text).length;
+  function wrapWords(text, width) {
+    const lines = []; let line = '';
+    for (const word of text.split(' ')) {
+      if (line && cellWidth(line + ' ' + word) > width) { lines.push(line); line = ''; }
+      line += (line ? ' ' : '') + word;
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+  function layout(items, capacity, maximum, separator) {
+    const gap = cellWidth(separator);
+    const rows = [[]]; let used = 0;
+    for (const item of items) {
+      const length = cellWidth(item.text);
+      if (used && used + gap + length > capacity) { rows.push([]); used = 0; }
+      rows[rows.length - 1].push(item);
+      used += (used ? gap : 0) + length;
+    }
+    if (rows.length <= maximum) return {rows, hidden: 0};
+    const shown = rows.slice(0, maximum);
+    const last = shown[shown.length - 1];
+    let hidden = items.length - shown.flat().length;
+    const width = () => last.reduce((sum, item) => sum + cellWidth(item.text), 0) + Math.max(0, last.length - 1) * gap;
+    while (last.length && width() + gap + cellWidth('… ещё ' + hidden) > capacity) { last.pop(); hidden++; }
+    last.push({text:'… ещё ' + hidden, kind:'', more:true});
+    return {rows:shown, hidden};
+  }
+  function render() {
+    const columns = Number($('columns').value);
+    const selected = $('selected').value;
+    const selectedAgent = agents.find(a => a.id === selected);
+    const showSpaces = $('spaces').checked;
+    const metrics = wrapWords(' Выбранный · посл. данные · контекст: 190K / 475K · неделя: 54% осталось', columns);
+    const maximum = Math.max(1, 3 - metrics.length);
+    const variants = [
+      {id:'tiles', separator:' · '},
+      {id:'dividers', separator:' │ '},
+      {id:'brackets', separator:' '},
+      {id:'compact', separator:' · '}
+    ];
+    for (const variant of variants) {
+      const part = name => $(variant.id + '-' + name);
+      const items = agents.slice(0, Number($('count').value)).map(a => {
+        let text = (a.id === selected ? '▶ ' : '') + a.name;
+        if (a.state) text += variant.id === 'compact'
+          ? ' ' + (a.kind === 'working' ? '●' : a.kind === 'closed' ? '×' : '✓')
+          : ' — ' + a.state;
+        if (variant.id === 'brackets') text = '[' + text + ']';
+        return {...a, text};
+      });
+      const arranged = layout(items, columns - 4 - cellWidth(prefix), maximum, variant.separator);
+      part('terminal').style.setProperty('--columns', columns);
+      part('ruler').textContent = Array.from({length:columns}, (_, i) => (i + 1) % 10 === 0 ? String(((i + 1) / 10) % 10) : '·').join('');
+      const container = part('agent-rows'); container.replaceChildren();
+      arranged.rows.forEach((row, index) => {
+        const line = document.createElement('div'); line.className = 'line agents';
+        const lead = document.createElement('span'); lead.className = 'prefix'; lead.textContent = index ? continuation : prefix;
+        line.append(lead);
+        row.forEach((item, position) => {
+          if (position) {
+            const gap = document.createElement('span'); gap.className = 'gap';
+            gap.textContent = showSpaces ? variant.separator.replaceAll(' ', '·') : variant.separator;
+            line.append(gap);
+          }
+          const block = document.createElement('span');
+          block.className = item.more ? '' : 'block ' + item.kind + (item.id === selected ? ' selected' : '');
+          block.textContent = showSpaces ? item.text.replaceAll(' ', '·') : item.text;
+          line.append(block);
+        });
+        container.append(line);
+      });
+      const metricContainer = part('metric-rows'); metricContainer.replaceChildren();
+      metrics.forEach(text => { const line = document.createElement('div'); line.className = 'line metrics'; line.textContent = text; metricContainer.append(line); });
+      part('help').textContent = (' Сейчас: ' + selectedAgent.name + ' · /subagents: выбор · ⌥←/→: Codex').slice(0, columns);
+      part('summary').textContent = arranged.rows.length + ' строки агентов · ' + (arranged.rows.length + metrics.length + 4) + ' строк панели с отступами' + (arranged.hidden ? ' · за «ещё»: ' + arranged.hidden : '');
+    }
+    $('result').textContent = 'Общий отступ во всех вариантах: 1 строка сверху и снизу, 2 символа слева и справа. Отступы внутри отдельных агентов: 0.';
+  }
+  ['columns','count','selected','spaces'].forEach(id => $(id).addEventListener('change', render));
+  render();
+})();
+</script>
+</body>
+</html>

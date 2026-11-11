@@ -1,0 +1,116 @@
+<div id="agent-panel-designs" aria-label="Варианты оформления панели агентов">
+  <style>
+    #agent-panel-designs .stage { min-height: 260px; display: flex; align-items: center; padding: 18px 0; box-sizing: border-box; }
+    #agent-panel-designs .terminal { --agent-gap: 2ch; width: 100%; min-width: 0; background: #252525; color: #e4e4e4; font: 13px/1.7 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    #agent-panel-designs .project { padding: 3px 10px; color: #c4c4c4; overflow-wrap: anywhere; }
+    #agent-panel-designs .agents { background: #303030; padding: 5px 10px; }
+    #agent-panel-designs .agent-list { display: flex; flex-wrap: wrap; align-items: center; gap: 4px var(--agent-gap); }
+    #agent-panel-designs .agent { display: inline-flex; align-items: baseline; gap: 1ch; white-space: nowrap; }
+    #agent-panel-designs .name { font-weight: 400; }
+    #agent-panel-designs .main .name, #agent-panel-designs .working .name { font-weight: 700; }
+    #agent-panel-designs .working { color: #83d6e9; }
+    #agent-panel-designs .closed { color: #a6a6a6; }
+    #agent-panel-designs .state { color: inherit; }
+    #agent-panel-designs .selected { color: #fff1ad; background: #494637; }
+    #agent-panel-designs .selected .name { font-weight: 700; }
+    #agent-panel-designs .blocks .agent { padding: 0 1ch; background: #3c3c3c; }
+    #agent-panel-designs .blocks .agent.selected { background: #494637; }
+    #agent-panel-designs .separators .agent { padding-right: var(--agent-gap); border-right: 1px solid #777; }
+    #agent-panel-designs .separators .agent:last-child { border-right: 0; }
+    #agent-panel-designs .separators .agent.selected { padding-left: 1ch; }
+    #agent-panel-designs .columns .agent-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 28ch), 1fr)); align-items: stretch; }
+    #agent-panel-designs .columns .agent { display: flex; flex-direction: row; justify-content: space-between; gap: 1ch; padding: 0 1ch; border-left: 1px solid #777; }
+    #agent-panel-designs .metrics { padding: 3px 10px; color: #c4c4c4; background: #282828; }
+    #agent-panel-designs .help { padding: 3px 10px; color: #d0d0d0; background: #202020; }
+    @media (max-width: 540px) { #agent-panel-designs .stage { min-height: 440px; } }
+  </style>
+  <div class="viz-carousel viz-dotted-background" aria-label="Оформление информационной панели" data-previous-label="Предыдущий вариант" data-next-label="Следующий вариант">
+    <section data-variant="Блоки" aria-label="Агенты отдельными прямоугольными блоками">
+      <div class="stage"><div class="terminal blocks">
+        <div class="project">codex-tools · development · браузер: CLI проверен</div>
+        <div class="agents"><div class="agent-list"></div></div>
+        <div class="metrics">Выбранный · посл. данные · контекст: 190K / 475K · неделя: 54% осталось</div>
+        <div class="help"></div>
+      </div></div>
+    </section>
+    <section data-variant="Разделители" aria-label="Компактная строка с вертикальными разделителями" hidden>
+      <div class="stage"><div class="terminal separators">
+        <div class="project">codex-tools · development · браузер: CLI проверен</div>
+        <div class="agents"><div class="agent-list"></div></div>
+        <div class="metrics">Выбранный · посл. данные · контекст: 190K / 475K · неделя: 54% осталось</div>
+        <div class="help"></div>
+      </div></div>
+    </section>
+    <section data-variant="Колонки" aria-label="Выровненные колонки с состояниями справа" hidden>
+      <div class="stage"><div class="terminal columns">
+        <div class="project">codex-tools · development · браузер: CLI проверен</div>
+        <div class="agents"><div class="agent-list"></div></div>
+        <div class="metrics">Выбранный · посл. данные · контекст: 190K / 475K · неделя: 54% осталось</div>
+        <div class="help"></div>
+      </div></div>
+    </section>
+  </div>
+  <script>
+    (() => {
+      const root = document.getElementById('agent-panel-designs');
+      const agents = [
+        { id: 'main', name: 'Основной: development', status: 'основной', symbol: '◆', cls: 'main' },
+        { id: 'pascal', name: 'Pascal', status: 'работает', symbol: '●', cls: 'working' },
+        { id: 'nash', name: 'Nash', status: 'работает', symbol: '●', cls: 'working' },
+        { id: 'ramanujan', name: 'Ramanujan', status: 'готов', symbol: '✓', cls: '' },
+        { id: 'arendt', name: 'Arendt', status: 'закрыт', symbol: '×', cls: 'closed' }
+      ];
+      const state = { gap: 2, labels: true, selected: 'nash' };
+      function restore(value) {
+        const saved = value && value.modelContent;
+        if (!saved) return;
+        if ([1, 2, 3].includes(saved.gap)) state.gap = saved.gap;
+        if (typeof saved.labels === 'boolean') state.labels = saved.labels;
+        if (agents.some(a => a.id === saved.selected)) state.selected = saved.selected;
+      }
+      function render() {
+        const selected = agents.find(a => a.id === state.selected);
+        root.querySelectorAll('.terminal').forEach(panel => {
+          panel.style.setProperty('--agent-gap', state.gap + 'ch');
+          const list = panel.querySelector('.agent-list');
+          list.replaceChildren();
+          agents.forEach(agent => {
+            const entry = document.createElement('span');
+            entry.className = 'agent ' + agent.cls + (agent.id === state.selected ? ' selected' : '');
+            entry.setAttribute('aria-label', agent.name + ', ' + agent.status + (agent.id === state.selected ? ', выбран' : ''));
+            const name = document.createElement('span');
+            name.className = 'name';
+            name.textContent = (agent.id === state.selected ? '▶ ' : '') + agent.name;
+            entry.appendChild(name);
+            if (agent.id !== 'main') {
+              const status = document.createElement('span');
+              status.className = 'state';
+              status.textContent = agent.symbol + (state.labels ? ' ' + agent.status : '');
+              entry.appendChild(status);
+            }
+            list.appendChild(entry);
+          });
+          panel.querySelector('.help').textContent = 'Сейчас: ' + selected.name + ' · /subagents: выбор · ⌥←/→: Codex';
+        });
+      }
+      function changed() {
+        render();
+        if (window.openai && window.openai.setWidgetState) {
+          window.openai.setWidgetState({ modelContent: { ...state }, privateContent: null }).catch(() => {});
+        }
+      }
+      restore(window.openai && window.openai.widgetState);
+      render();
+      window.addEventListener('openai:set_globals', event => {
+        restore(event.detail && event.detail.globals && event.detail.globals.widgetState);
+        render();
+      });
+      if (globalThis.Tweak) {
+        const tweak = new Tweak({ container: root, onChange: changed });
+        tweak.addSlider(state, 'gap', { label: 'Пробелов между агентами', min: 1, max: 3, step: 1 });
+        tweak.addToggle(state, 'labels', { label: 'Подписи состояний' });
+        tweak.addSelect(state, 'selected', { label: 'Выбранный поток в примере', options: agents.map(a => ({ label: a.name, value: a.id })) });
+      }
+    })();
+  </script>
+</div>

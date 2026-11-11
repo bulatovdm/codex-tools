@@ -95,5 +95,24 @@ class BrowserGuardTests(unittest.TestCase):
             self.run_guard()
         self.assertEqual(other.read_bytes(), original)
 
+    def test_native_repl_without_script_arguments_is_valid_and_idempotent(self):
+        data = json.loads(self.plugin.read_text())
+        server = data['mcpServers']['cua_repl']
+        executable = str(self.root / 'runtime/bin/node_repl')
+        server['command'] = '/bin/sh'
+        server['args'] = ['-c', 'export BROWSER_USE_ACCESS_EXECUTOR_ID="${BROWSER_USE_ACCESS_EXECUTOR_ID-}"; exec "$@"', 'cua-repl', executable]
+        self.plugin.write_text(json.dumps(data))
+        self.run_guard()
+        repaired = json.loads(self.plugin.read_text())['mcpServers']['cua_repl']
+        self.assertEqual(repaired['command'], executable)
+        self.assertEqual(repaired['args'], [])
+        self.assertEqual(repaired['env']['ALLOW'], 'unchanged')
+        self.assertEqual(self.run_guard(), [])
+
+    def test_node_without_entrypoint_is_still_rejected(self):
+        server = {'command': '/bin/sh', 'args': ['-c', 'export BROWSER_USE_ACCESS_EXECUTOR_ID=""; exec "$@"', 'cua-repl', 'node']}
+        with self.assertRaisesRegex(ValueError, 'Unsupported'):
+            guard.normalize_cua_repl_launch(server)
+
 if __name__ == '__main__':
     unittest.main()

@@ -408,6 +408,15 @@ def configure_lifecycle(tmux, directory):
                     'destroy-unattached', 'off', '\\;', 'detach-client'], check=True)
 
 
+def configure_agent_status(tmux, directory):
+    prefix = [tmux, '-L', 'codex-tools-' + directory.name, '-f', '/dev/null']
+    subprocess.run([*prefix, 'set-option', '-g', 'status', '2'], check=True)
+    for index in range(4):
+        command = shlex.join(['/usr/bin/python3', str(ROOT / 'status.py'), '--run', directory.name,
+                              '--tmux', '--agents', '--agent-row', str(index), '--width', '#{client_width}'])
+        subprocess.run([*prefix, 'set-option', '-g', 'status-format[' + str(index + 1) + ']', '#(' + command + ')'], check=True)
+
+
 def attach_with_close_marker(tmux, directory):
     """Record a terminal hangup before tmux destroys this private run."""
     previous = signal.getsignal(signal.SIGHUP)
@@ -531,6 +540,7 @@ def reuse_resume(tmux, arguments, cwd):
         print('Этот разговор уже открыт: к запуску подключён другой терминал.')
         return 1
     configure_lifecycle(tmux, chosen['directory'])
+    configure_agent_status(tmux, chosen['directory'])
     print('Возвращаюсь в работающий Codex: ' + chosen['session_id'])
     result = attach_with_close_marker(tmux, chosen['directory'])
     return finish_attachment(chosen['directory'], result, tmux)
@@ -577,6 +587,7 @@ def run(arguments):
     for key, value in settings.items():
         subprocess.run([*prefix, 'set-option', '-g', key, value], check=True)
     configure_lifecycle(tmux, directory)
+    configure_agent_status(tmux, directory)
     print('Ctrl-C прерывает работу; на пустом вводе выходит. /quit — полный выход.')
     print('Закрытие окна завершает запуск. Ctrl-B, затем D — сохранить в фоне.')
     sys.stdout.flush()

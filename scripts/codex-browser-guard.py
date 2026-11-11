@@ -90,6 +90,50 @@ def node_repl_plan(config, cli, root):
     return (config, before, after) if after != before else None
 
 
+ACCESS_BOOTSTRAP = 'require-browser-access.mjs'
+ACCESS_BOOTSTRAP_MARKER = 'BROWSER_USE_ACCESS_EXECUTOR_ID'
+
+
+def strip_access_bootstrap(arguments):
+    cleaned = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if (argument == '--import' and index + 1 < len(arguments)
+                and str(arguments[index + 1]).endswith(ACCESS_BOOTSTRAP)):
+            index += 2
+            continue
+        if argument.startswith('--import=') and argument.endswith(ACCESS_BOOTSTRAP):
+            index += 1
+            continue
+        if argument.endswith(ACCESS_BOOTSTRAP):
+            index += 1
+            continue
+        cleaned.append(argument)
+        index += 1
+    return cleaned
+
+
+def normalize_cua_repl_launch(server):
+    arguments = server.get('args')
+    if not isinstance(arguments, list):
+        return False
+    if (len(arguments) >= 4 and arguments[0] == '-c'
+            and ACCESS_BOOTSTRAP_MARKER in str(arguments[1])):
+        launch = arguments[3]
+        cleaned = strip_access_bootstrap(list(arguments[4:]))
+        if not cleaned and pathlib.Path(launch).name != 'node_repl':
+            raise ValueError('Unsupported cua_repl launcher: ' + str(arguments))
+        server['command'] = launch
+        server['args'] = cleaned
+        return True
+    cleaned = strip_access_bootstrap(arguments)
+    if cleaned != arguments:
+        server['args'] = cleaned
+        return True
+    return False
+
+
 def plugin_plan(path, cli, root):
     before = readable_configuration(path, root)
     parsed = json.loads(before)
@@ -101,11 +145,12 @@ def plugin_plan(path, cli, root):
     if not isinstance(server, dict) or not isinstance(server.get('env'), dict):
         raise ValueError('Unsupported cua_repl environment: ' + str(path))
     environment = server['env']
-    if 'CODEX_CLI_PATH' not in environment:
-        raise ValueError('Missing cua_repl CODEX_CLI_PATH: ' + str(path))
-    if environment['CODEX_CLI_PATH'] == str(cli):
+    changed = normalize_cua_repl_launch(server)
+    if environment.get('CODEX_CLI_PATH') != str(cli):
+        environment['CODEX_CLI_PATH'] = str(cli)
+        changed = True
+    if not changed:
         return None
-    environment['CODEX_CLI_PATH'] = str(cli)
     return path, before, (json.dumps(parsed, ensure_ascii=False, indent=2) + '\n').encode()
 
 

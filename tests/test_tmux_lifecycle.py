@@ -116,6 +116,20 @@ while True:
         os.close(fd)
         self.wait_for(lambda: not self.alive())
 
+    def test_agent_overview_has_own_status_row(self):
+        self.module.configure_agent_status(TMUX, self.directory)
+        self.assertEqual(self.command('show-options', '-gv', 'status').stdout.strip(), '2')
+        row = self.command('show-options', '-gv', 'status-format[1]').stdout
+        self.assertIn('--agents', row)
+        self.assertIn(self.directory.name, row)
+        spec = importlib.util.spec_from_file_location('status_height', ROOT / 'scripts/status.py')
+        status = importlib.util.module_from_spec(spec); spec.loader.exec_module(status)
+        status.update_agent_height(self.directory.name, 3, Path.home())
+        self.assertEqual(self.command('show-options', '-gv', 'status').stdout.strip(), '4')
+        status.update_agent_height(self.directory.name, 1, Path.home())
+        self.assertEqual(self.command('show-options', '-gv', 'status').stdout.strip(), '2')
+
+
     def test_wrapper_observes_window_close_signal(self):
         marker = self.directory / 'normal-close'
         pid, fd = pty.fork()

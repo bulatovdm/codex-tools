@@ -80,6 +80,133 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(value['project'], self.root.name)
         self.assertNotIn('listener', value)
 
+    def test_agents_resolve_main_and_distinguish_working_ready_and_closed(self):
+        directory = self.root / '.codex'; directory.mkdir()
+        with sqlite3.connect(directory / 'state_5.sqlite') as db:
+            db.execute('CREATE TABLE threads (id TEXT, name TEXT, agent_nickname TEXT)')
+            db.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)')
+            db.executemany('INSERT INTO threads VALUES (?,?,?)', [
+                ('main','Мой основной поток',None), ('a','task','Pascal'),
+                ('b','task','Ramanujan'), ('c','old','Fermat'), ('foreign','Чужой',None)])
+            db.executemany('INSERT INTO thread_spawn_edges VALUES (?,?,?)', [
+                ('main','a','open'), ('a','b','open'), ('main','c','closed')])
+        with sqlite3.connect(directory / 'thread_history_1.sqlite') as db:
+            db.execute('CREATE TABLE thread_turns (thread_id TEXT, status TEXT, rollout_ordinal INTEGER)')
+            db.executemany('INSERT INTO thread_turns VALUES (?,?,?)', [
+                ('a','completed',1), ('a','inProgress',3), ('b','completed',4), ('c','inProgress',9)])
+        text = status.agent_overview('b', {}, self.root)
+        self.assertIn('Основной: Мой основной поток', text)
+        self.assertIn('Pascal — работает', text)
+        self.assertIn('Ramanujan — готов', text)
+        self.assertIn('закрыты: 1', text)
+        self.assertNotIn('Fermat — работает', text)
+        self.assertNotIn('Чужой', text)
+        selected = status.agent_overview('main', {}, self.root, structured=True, selected='b', show_selection=True)
+        self.assertIn(('▶ Ramanujan — готов', 'selected'), selected)
+        self.assertFalse(any(text.startswith('▶ Основной') for text, _ in selected))
+        unknown = status.agent_overview('main', {}, self.root, structured=True, selected='foreign', show_selection=True)
+        self.assertTrue(any('Выбранный: неизвестен' in text for text, _ in unknown))
+        closed = status.agent_overview('main', {}, self.root, structured=True, selected='c')
+        self.assertIn(('▶ Fermat — закрыт', 'selected'), closed)
+        self.assertEqual(closed[1], ('Pascal — работает', 'working'))
+        (directory / 'thread_history_1.sqlite').unlink()
+        self.assertIn('статус неизвестен', status.agent_overview('main', {}, self.root))
+
+    def test_agent_data_unavailable_is_not_claimed_as_no_active_agents(self):
+        self.assertEqual(status.agent_overview('', {}, self.root), '')
+        self.assertEqual(status.agent_overview('missing', {}, self.root), 'Агенты: данные недоступны')
+
+    def test_agent_rows_wrap_and_style_working_entries_only(self):
+        entries = [('Основной: task', 'main'), ('Pascal — работает', True), ('Fermat — готов', False)]
+        plain = status.agent_rows(entries, 35)
+        self.assertGreater(len(plain), 1)
+        self.assertTrue(all(status.cell_width(row) <= 35 for row in plain))
+        styled = ''.join(status.agent_rows(entries, 35, tmux=True))
+        self.assertIn('#[bg=colour236,fg=colour255,bold]Основной: task', styled)
+        self.assertIn('#[bg=colour236,fg=colour117,bold]Pascal', styled)
+        self.assertIn('#[bg=colour236,fg=colour255,nobold]Fermat', styled)
+
+    def test_agent_wrapping_handles_wide_names_and_escapes_untrusted_markup(self):
+        entries = [('中文名字' * 15 + '\033#[bg=red]', True)]
+        plain = status.agent_rows(entries, 30)
+        self.assertLessEqual(len(plain), 4)
+        self.assertTrue(all(status.cell_width(row) <= 30 for row in plain))
+        escaped = ''.join(status.agent_rows([('#[bg=red]', False)], 80, tmux=True))
+        self.assertIn('##[bg=red]', escaped)
+
+    def test_current_thread_is_read_only_from_last_native_footer(self):
+        native = '01a1ca26-c037-78e3-b5fd-e84a1864161e'
+        self.assertEqual(status.footer_thread_id('text\n  ' + native + ' · model\n'), native)
+        self.assertIsNone(status.footer_thread_id(native + '\n› input\nmodel · context'))
+        self.assertIsNone(status.footer_thread_id('› ' + native))
+        self.assertEqual(status.footer_thread_id('  model · Context 47% left · ' + native + '\n  ← for agents'), native)
+        partial = '01a1bfd0-20fa-7fa0-…'
+        self.assertEqual(status.footer_thread_id('  model · Context 47% left · 475K window · ' + partial), partial)
+        root = '01a1bfd0-20fa-7fa0-bb94-4234ce3209b2'
+        self.assertEqual(status.resolve_visible_agent(partial, [root, native]), root)
+        self.assertIsNone(status.resolve_visible_agent(partial, [root, root[:-1] + '3']))
+
+    def test_selected_agent_style_is_distinct_from_working_state(self):
+        text = ''.join(status.agent_rows([('▶ Pascal — работает', 'selected'), ('Ramanujan — работает', True)], 120, tmux=True))
+        self.assertIn('#[bg=colour238,fg=colour229,bold]▶ Pascal', text)
+        self.assertIn('#[bg=colour236,fg=colour117,bold]', text)
+
+    def test_agent_controls_have_dedicated_last_row(self):
+        rows = status.agent_panel_rows([('Основной: main', 'main'), ('▶ Pascal — работает', 'selected')], 160)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0], ' ' * 160)
+        self.assertEqual(rows[2], ' ' * 160)
+        self.assertTrue(rows[1].startswith('  Основной: main'))
+        self.assertTrue(rows[1].endswith('  '))
+        self.assertIn('▶ Pascal ●', rows[1])
+        self.assertNotIn('работает', rows[1])
+        self.assertNotIn('/subagents', ''.join(rows[:-1]))
+        self.assertIn('/subagents', rows[-1])
+        self.assertIn('Сейчас: Pascal', rows[-1])
+        unknown = status.agent_panel_rows([('Основной: main', 'main')], 160)
+        self.assertIn('Выбор: Codex', unknown[-1])
+        self.assertNotIn('первым', unknown[-1])
+        self.assertNotIn('Выбранный: неизвестен', ''.join(unknown))
+
+    def test_agent_order_does_not_change_with_state_or_alphabet(self):
+        directory = self.root / '.codex'; directory.mkdir()
+        with sqlite3.connect(directory / 'state_5.sqlite') as db:
+            db.execute('CREATE TABLE threads (id TEXT, name TEXT, agent_nickname TEXT, created_at_ms INTEGER)')
+            db.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)')
+            db.executemany('INSERT INTO threads VALUES (?,?,?,?)', [('main','Main',None,0),('a','a','Alpha',3),('z','z','Zulu',1),('c','c','Closed',2)])
+            db.executemany('INSERT INTO thread_spawn_edges VALUES (?,?,?)', [('main','a','open'),('main','c','closed'),('main','z','open')])
+        with sqlite3.connect(directory / 'thread_history_1.sqlite') as db:
+            db.execute('CREATE TABLE thread_turns (thread_id TEXT, status TEXT, rollout_ordinal INTEGER)')
+            db.executemany('INSERT INTO thread_turns VALUES (?,?,?)', [('a','inProgress',1),('z','completed',1)])
+        parts = status.agent_overview('main', {}, self.root, structured=True)
+        self.assertEqual([style.native for _,style in parts if isinstance(style,status.AgentStyle)], ['main','z','c','a'])
+        self.assertIn(('Closed — закрыт','closed'), parts)
+
+    def test_metrics_use_exact_thread_and_actual_quota_window(self):
+        directory = self.root / '.codex'; directory.mkdir()
+        rollout = directory / 'thread.jsonl'
+        event = {'type':'event_msg','payload':{'type':'token_count','info':{'last_token_usage':{'total_tokens':95000},'model_context_window':475000},
+            'rate_limits':{'primary':{'window_minutes':10080,'used_percent':46,'resets_at':9999999999}}}}
+        rollout.write_text(json.dumps(event)+'\n')
+        with sqlite3.connect(directory / 'state_5.sqlite') as db:
+            db.execute('CREATE TABLE threads (id TEXT, rollout_path TEXT, model TEXT, reasoning_effort TEXT)')
+            db.execute('INSERT INTO threads VALUES (?,?,?,?)', ('ours',str(rollout),'gpt-6.1-sol','medium'))
+        value = status.session_metrics('ours', {}, self.root)
+        self.assertIn('95K / 475K', value)
+        self.assertIn('gpt-6.1-sol medium', value)
+        self.assertNotIn('снимок', value)
+        self.assertNotIn('посл. данные', value)
+        self.assertIn('неделя: 54% осталось', value)
+        self.assertEqual(status.session_metrics('other', {}, self.root), '')
+        event['payload']['rate_limits']['primary']['resets_at'] = 1
+        rollout.write_text(json.dumps(event)+'\n')
+        self.assertIn('неделя: ожидает данных', status.session_metrics('ours', {}, self.root))
+        rows = status.agent_panel_rows([('Основной: Main','main')], 120, metrics='Основной · '+value)
+        self.assertLessEqual(len(rows),4)
+        self.assertIn('475K', '\n'.join(rows))
+        self.assertIn('неделя:', '\n'.join(rows))
+
+
     def test_rename_is_read_on_each_refresh_for_exact_session(self):
         directory = self.root / '.codex'; directory.mkdir()
         with sqlite3.connect(directory / 'state_5.sqlite') as connection:
