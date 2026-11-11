@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -80,6 +81,34 @@ class AgentStyle(str):
         item.running = running
         return item
 
+def latest_agent_status(rollout, fallback, recorded_at=0):
+    """Read lifecycle metadata that may reach the rollout before the history index."""
+    if not rollout:
+        return fallback
+    states = {'task_started': 'inProgress', 'task_complete': 'completed',
+              'turn_aborted': 'interrupted', 'task_failed': 'failed'}
+    try:
+        with pathlib.Path(rollout).open('rb') as source:
+            source.seek(0, 2)
+            source.seek(max(0, source.tell() - 262144))
+            lines = source.read().splitlines()
+        for line in reversed(lines):
+            try:
+                event = json.loads(line)
+                payload = event.get('payload', {})
+                if event.get('type') != 'event_msg' or payload.get('type') not in states:
+                    continue
+                at = datetime.datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).timestamp()
+                # History timestamps have second precision. A recorded terminal
+                # state wins ties against an earlier start within that second.
+                boundary = recorded_at + (1 if fallback in ('completed', 'interrupted', 'failed') else 0)
+                return states[payload['type']] if at >= boundary else fallback
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+    except (OSError, ValueError):
+        pass
+    return fallback
+
 def agent_overview(session, environment, home, structured=False, selected=None, show_selection=False):
     """Read only explicit spawn edges and persisted turn states, never messages."""
     if not session:
@@ -106,12 +135,13 @@ def agent_overview(session, environment, home, structured=False, selected=None, 
         label = name[0] or 'Без названия'
         navigation = [('⌥←/→: переключить · /subagents: список', False)] if show_selection else []
         columns = {row[1] for row in connection.execute('PRAGMA table_info(threads)')}
+        rollout_column = 't.rollout_path' if 'rollout_path' in columns else 'NULL'
         order = 't.created_at_ms, t.id' if 'created_at_ms' in columns else 't.created_at, t.id' if 'created_at' in columns else 't.rowid'
         children = connection.execute('''WITH RECURSIVE family(id) AS (
             SELECT ? UNION SELECT e.child_thread_id FROM thread_spawn_edges e JOIN family f ON e.parent_thread_id = f.id
-        ) SELECT t.id, t.agent_nickname, t.name, e.status FROM family f
+        ) SELECT t.id, t.agent_nickname, t.name, e.status, ''' + rollout_column + ''' FROM family f
           JOIN threads t ON t.id = f.id JOIN thread_spawn_edges e ON e.child_thread_id = t.id
-          WHERE t.id != ? ORDER BY ''' + order + ' LIMIT 128', (root, root)).fetchall()
+          WHERE t.id != ? ORDER BY ''' + order, (root, root)).fetchall()
         selected = resolve_visible_agent(selected, [root] + [child[0] for child in children])
         main_part = (('▶ ' if selected == root else '') + 'Основной: ' + label,
                      AgentStyle('selected' if selected == root else 'main', root))
@@ -122,24 +152,35 @@ def agent_overview(session, environment, home, structured=False, selected=None, 
             return parts if structured else ' · '.join(text for text, _ in parts)
         try:
             history = sqlite3.connect((directory / 'thread_history_1.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2)
+            turn_columns = {row[1] for row in history.execute('PRAGMA table_info(thread_turns)')}
         except sqlite3.Error:
             pass
         active = []
         closed = 0
         states = {'inProgress': 'работает', 'completed': 'готов', 'failed': 'ошибка', 'interrupted': 'прерван'}
-        for native, nickname, title, edge in children:
+        for native, nickname, title, edge, rollout in children:
             if edge == 'closed':
                 closed += 1
                 active.append(('закрыт', nickname or title or 'Без названия', native))
                 continue
             status = None
+            recorded_at = 0
             if history is not None:
                 try:
-                    row = history.execute('SELECT status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1', (native,)).fetchone()
+                    has_times = {'started_at', 'completed_at'} <= turn_columns
+                    times = ', started_at, completed_at' if has_times else ''
+                    ordering = 'started_at DESC, rowid DESC' if has_times else 'rollout_ordinal DESC'
+                    row = history.execute('SELECT status' + times + ' FROM thread_turns WHERE thread_id = ? ORDER BY ' + ordering + ' LIMIT 1', (native,)).fetchone()
                     status = row[0] if row else None
+                    if row and has_times:
+                        recorded_at = row[2] or row[1] or 0
                 except sqlite3.Error:
                     pass
+            status = latest_agent_status(rollout, status, recorded_at)
             active.append((states.get(status, 'статус неизвестен'), nickname or title or 'Без названия', native))
+        # Keep creation order within each group, but never truncate working
+        # agents behind old completed or closed threads.
+        active.sort(key=lambda item: 0 if item[0] == 'работает' else 2 if item[0] == 'закрыт' else 1)
         parts = [main_part] + navigation
         parts.extend((('▶ ' if selected == native else '') + name + ' — ' + state,
                       AgentStyle('selected' if selected == native else 'working' if state == 'работает' else 'closed' if state == 'закрыт' else '', native,

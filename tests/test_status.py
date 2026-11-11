@@ -168,7 +168,7 @@ class StatusTests(unittest.TestCase):
         self.assertNotIn('первым', unknown[-1])
         self.assertNotIn('Выбранный: неизвестен', ''.join(unknown))
 
-    def test_agent_order_does_not_change_with_state_or_alphabet(self):
+    def test_working_agents_move_first_and_refresh_after_state_changes(self):
         directory = self.root / '.codex'; directory.mkdir()
         with sqlite3.connect(directory / 'state_5.sqlite') as db:
             db.execute('CREATE TABLE threads (id TEXT, name TEXT, agent_nickname TEXT, created_at_ms INTEGER)')
@@ -179,8 +179,54 @@ class StatusTests(unittest.TestCase):
             db.execute('CREATE TABLE thread_turns (thread_id TEXT, status TEXT, rollout_ordinal INTEGER)')
             db.executemany('INSERT INTO thread_turns VALUES (?,?,?)', [('a','inProgress',1),('z','completed',1)])
         parts = status.agent_overview('main', {}, self.root, structured=True)
-        self.assertEqual([style.native for _,style in parts if isinstance(style,status.AgentStyle)], ['main','z','c','a'])
+        self.assertEqual([style.native for _,style in parts if isinstance(style,status.AgentStyle)], ['main','a','z','c'])
         self.assertIn(('Closed — закрыт','closed'), parts)
+        self.assertIn('Alpha ●', status.agent_panel_rows(parts, 50)[1])
+        with sqlite3.connect(directory / 'thread_history_1.sqlite') as db:
+            db.executemany('INSERT INTO thread_turns VALUES (?,?,?)', [('a','completed',2),('z','inProgress',2)])
+        refreshed = status.agent_overview('main', {}, self.root, structured=True)
+        self.assertEqual([style.native for _,style in refreshed if isinstance(style,status.AgentStyle)], ['main','z','a','c'])
+        self.assertIn(('Zulu — работает','working'), refreshed)
+        self.assertIn(('Alpha — готов',''), refreshed)
+
+    def test_rollout_lifecycle_updates_agents_before_history_index(self):
+        directory = self.root / '.codex'; directory.mkdir()
+        rollout = directory / 'agent.jsonl'
+        with sqlite3.connect(directory / 'state_5.sqlite') as db:
+            db.execute('CREATE TABLE threads (id TEXT, name TEXT, agent_nickname TEXT, rollout_path TEXT)')
+            db.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)')
+            db.executemany('INSERT INTO threads VALUES (?,?,?,?)', [('main','Main',None,None),('a','task','Fresh',str(rollout))])
+            db.execute('INSERT INTO thread_spawn_edges VALUES (?,?,?)', ('main','a','open'))
+        with sqlite3.connect(directory / 'thread_history_1.sqlite') as db:
+            db.execute('CREATE TABLE thread_turns (thread_id TEXT, status TEXT, rollout_ordinal INTEGER, started_at INTEGER, completed_at INTEGER)')
+            # A resumed rollout can have a lower ordinal than an older turn.
+            db.executemany('INSERT INTO thread_turns VALUES (?,?,?,?,?)', [('a','inProgress',900,1,None),('a','completed',1,2,3)])
+        self.assertIn('Fresh — готов', status.agent_overview('main', {}, self.root))
+        for event, expected in [('task_started','работает'), ('task_complete','готов'), ('task_started','работает'), ('turn_aborted','прерван')]:
+            with rollout.open('a') as output:
+                output.write(json.dumps({'timestamp':'2026-11-11T16:00:00Z','type':'event_msg','payload':{'type':event}})+'\n')
+            self.assertIn('Fresh — '+expected, status.agent_overview('main', {}, self.root))
+        # A later indexed interruption must not be replaced by an old start.
+        self.assertEqual(status.latest_agent_status(rollout, 'failed', 9999999999), 'failed')
+
+    def test_active_agent_after_128_old_agents_is_still_visible(self):
+        directory = self.root / '.codex'; directory.mkdir()
+        with sqlite3.connect(directory / 'state_5.sqlite') as db:
+            db.execute('CREATE TABLE threads (id TEXT, name TEXT, agent_nickname TEXT)')
+            db.execute('CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT, status TEXT)')
+            db.execute('INSERT INTO threads VALUES (?,?,?)', ('main','Main',None))
+            for index in range(130):
+                ident = str(index)
+                db.execute('INSERT INTO threads VALUES (?,?,?)', (ident,'task','Agent'+ident))
+                db.execute('INSERT INTO thread_spawn_edges VALUES (?,?,?)', ('main',ident,'closed' if index < 129 else 'open'))
+        with sqlite3.connect(directory / 'thread_history_1.sqlite') as db:
+            db.execute('CREATE TABLE thread_turns (thread_id TEXT, status TEXT, rollout_ordinal INTEGER)')
+            db.execute('INSERT INTO thread_turns VALUES (?,?,?)', ('129','inProgress',1))
+        parts = status.agent_overview('main', {}, self.root, structured=True)
+        self.assertEqual(parts[1], ('Agent129 — работает','working'))
+        line = status.agent_panel_rows(parts, 70, tmux=True)[1]
+        self.assertIn('Agent129 ●', line)
+        self.assertIn('fg=colour117,bold', line)
 
     def test_metrics_use_exact_thread_and_actual_quota_window(self):
         directory = self.root / '.codex'; directory.mkdir()
