@@ -633,12 +633,14 @@ def run(arguments):
 def main():
     args = sys.argv[1:]
     if not args or args[0] in ['help', '--help', '-h']:
-        print('codex-tools run [Codex arguments]\ncodex-tools status [--session ID] [--json]\ncodex-tools doctor\ncodex-tools browser\ncodex-tools history [--apply] [--config PATH]')
+        print('codex-tools run [Codex arguments]\ncodex-tools status [--session ID] [--json]\ncodex-tools time --session ID [--reset-task] [--json]\ncodex-tools doctor\ncodex-tools browser\ncodex-tools history [--apply] [--config PATH]')
         return 0
     if args[0] == 'run':
         return run(args[1:])
     if args[0] == 'status':
         return subprocess.call(['/usr/bin/python3', str(ROOT / 'status.py'), *args[1:]])
+    if args[0] == 'time':
+        return subprocess.call(['/usr/bin/python3', str(ROOT / 'status.py'), '--work-time', *args[1:]])
     if args[0] == 'history':
         return subprocess.call(['python3', str(ROOT / 'history.py'), *args[1:]])
     if args[0] == 'browser':

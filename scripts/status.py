@@ -201,6 +201,89 @@ def agent_overview(session, environment, home, structured=False, selected=None, 
 def cell_width(text):
     return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in text)
 
+def merged_seconds(intervals, since=0):
+    total = 0
+    end = 0
+    for start, stop in sorted(intervals):
+        start = max(start, since, end)
+        if stop > start:
+            total += stop - start
+            end = stop
+    return total
+
+def work_duration(seconds):
+    minutes = max(0, int(seconds)) // 60
+    hours, minutes = divmod(minutes, 60)
+    return (str(hours) + 'ч ' if hours else '') + str(minutes) + 'м'
+
+def session_work_time(session, environment, home, live_since=None, reset_task=False, now=None):
+    """Union of recorded turn intervals, including descendants, without idle gaps."""
+    now = time.time() if now is None else now
+    directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
+    if not session:
+        return None
+    try:
+        with sqlite3.connect((directory / 'state_5.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2) as db:
+            root = session
+            seen = set()
+            while root not in seen:
+                seen.add(root)
+                parent = db.execute('SELECT parent_thread_id FROM thread_spawn_edges WHERE child_thread_id=?', (root,)).fetchone()
+                if not parent: break
+                root = parent[0]
+            else:
+                return None
+            if not db.execute('SELECT 1 FROM threads WHERE id=?', (root,)).fetchone(): return None
+            if not re.fullmatch(r'[a-f0-9-]{36}', root): return None
+            members = db.execute('''WITH RECURSIVE family(id) AS (
+                SELECT ? UNION SELECT e.child_thread_id FROM thread_spawn_edges e JOIN family f ON e.parent_thread_id=f.id
+            ) SELECT t.id, t.rollout_path, COALESCE(e.status, 'open') FROM family f
+              JOIN threads t ON t.id=f.id LEFT JOIN thread_spawn_edges e ON e.child_thread_id=t.id''', (root,)).fetchall()
+        intervals, ongoing = [], []
+        with sqlite3.connect((directory / 'thread_history_1.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2) as history:
+            for native, rollout, edge in members:
+                turns = history.execute('SELECT status, started_at, completed_at, duration_ms FROM thread_turns WHERE thread_id=? ORDER BY started_at, rowid', (native,)).fetchall()
+                for index, (state, start, complete, duration) in enumerate(turns):
+                    if not isinstance(start, (int, float)) or start <= 0: continue
+                    stop = start + max(0, duration) / 1000 if isinstance(duration, (int, float)) else complete
+                    # Only a current turn from this live run can advance a clock.
+                    # Old unfinished turns never grow through days of inactivity.
+                    if (state == 'inProgress' and index == len(turns) - 1 and edge != 'closed'
+                            and live_since is not None and start >= int(live_since)
+                            and latest_agent_status(rollout, state, start) == 'inProgress'):
+                        stop = now
+                        ongoing.append(start)
+                    if isinstance(stop, (int, float)) and stop >= start:
+                        intervals.append((start, min(stop, now)))
+        marker = home / '.local/share/codex-tools/timers' / (root + '.json')
+        since = None
+        if reset_task:
+            marker.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary = marker.with_name(marker.name + '.' + str(os.getpid()))
+            try:
+                temporary.write_text(json.dumps({'task_started_at': now}))
+                temporary.chmod(0o600)
+                os.replace(temporary, marker)
+            finally:
+                temporary.unlink(missing_ok=True)
+        try:
+            since = json.loads(marker.read_text()).get('task_started_at')
+        except (OSError, ValueError, AttributeError):
+            pass
+        return {'session_id': root, 'total_seconds': merged_seconds(intervals), 'live': live_since is not None,
+                'current_seconds': max(0, now - min(ongoing)) if ongoing else None,
+                'task_seconds': merged_seconds(intervals, since) if isinstance(since, (int, float)) else None}
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        return None
+
+def work_time_label(value):
+    if value is None: return 'Работа: история недоступна'
+    parts = ['Работа: ' + work_duration(value['total_seconds'])]
+    if value['task_seconds'] is not None: parts.append('задача: ' + work_duration(value['task_seconds']))
+    if value['live']:
+        parts.append('сейчас: ' + work_duration(value['current_seconds']) if value['current_seconds'] is not None else 'сейчас: пауза')
+    return ' · '.join(parts)
+
 def session_metrics(session, environment, home, run=None):
     """Use only persisted token metadata; never infer current quota after a reset."""
     cache = None
@@ -315,7 +398,7 @@ def agent_rows(overview, width, tmux=False, max_rows=4):
         rendered.append(result)
     return rendered
 
-def agent_panel_rows(overview, width, tmux=False, metrics=""):
+def agent_panel_rows(overview, width, tmux=False, metrics="", timing=""):
     """One compact agent row, padding around the group, and a shared info row."""
     width = max(16, min(width, 1000))
     def clip(text, limit):
@@ -373,7 +456,9 @@ def agent_panel_rows(overview, width, tmux=False, metrics=""):
     info = clip(' ' + ' · '.join(part for part in (who, data) if part), available)
     info += ' ' * max(0, available - cell_width(info)) + clip(controls, width - cell_width(info))
     if tmux: info = '#[bg=colour234,fg=colour248,nobold]' + info.replace('#', '##')
-    return [blank, line, blank, info]
+    clock = clip('  ' + timing, width) if timing else ''
+    if tmux and clock: clock = '#[bg=colour236,fg=colour229,bold]' + clock.replace('#', '##') + '#[nobold]'
+    return [blank, line, clock or blank, info]
 
 def footer_thread_id(text):
     # Native footer may put thread-id last and truncate it to the available width.
@@ -493,15 +578,28 @@ def main():
     parser.add_argument('--agents', action='store_true')
     parser.add_argument('--agent-row', type=int)
     parser.add_argument('--width', type=int, default=120)
+    parser.add_argument('--work-time', action='store_true')
+    parser.add_argument('--reset-task', action='store_true')
     args = parser.parse_args()
     home = pathlib.Path.home()
     environment = dict(os.environ)
+    live_since = None
     if args.run:
         args.session = ''
         if not re.fullmatch(r'[a-f0-9]{32}', args.run):
             raise ValueError('Invalid run identifier')
         state = home / '.local/share/codex-tools/runs' / args.run
         launch = json.loads((state / 'launch.json').read_text())
+        live_since = (state / 'launch.json').stat().st_mtime
+        if args.work_time or (args.agents and args.agent_row == 2):
+            installed_tmux = home / '.local/share/codex-tools/tmux/bin/tmux'
+            tmux = str(installed_tmux) if installed_tmux.is_file() else shutil.which('tmux')
+            try:
+                check = subprocess.run([tmux, '-L', 'codex-tools-' + args.run, 'list-panes', '-t', 'codex', '-F', '#{pane_dead}'], capture_output=True, text=True, timeout=1) if tmux else None
+                if (state / 'exit-code').exists() or check is None or check.returncode or check.stdout.strip() != '0':
+                    live_since = None
+            except (OSError, subprocess.TimeoutExpired):
+                live_since = None
         environment.update(launch['environment'])
         args.cwd = launch['cwd']
         if (state / 'session.json').exists():
@@ -510,6 +608,14 @@ def main():
             args.cwd = session.get('cwd') or args.cwd
     settings = home / '.config/codex-tools/status.json'
     options = json.loads(settings.read_text()) if settings.exists() else {}
+    if args.work_time:
+        value = session_work_time(args.session, environment, home, live_since, args.reset_task)
+        if value is None:
+            raise ValueError('История времени недоступна; укажите --session UUID или --run RUN_ID')
+        print(json.dumps(value, ensure_ascii=False) if args.json else work_time_label(value))
+        return
+    if args.reset_task:
+        raise ValueError('--reset-task requires --work-time')
     if args.agents:
         if args.agent_row is not None:
             selected = visible_agent(args.run, home) if args.run else None
@@ -518,7 +624,8 @@ def main():
             root = next((style.native for _, style in overview if isinstance(style, AgentStyle) and style in ('main', 'selected')), args.session) if isinstance(overview, list) else args.session
             metrics = session_metrics(chosen or root, environment, home, args.run)
             label = ' Выбранный' if chosen else ' Основной'
-            rows = agent_panel_rows(overview, args.width, args.tmux, label + ' · ' + metrics if metrics else '')
+            timing = work_time_label(session_work_time(args.session, environment, home, live_since)) if args.agent_row == 2 else ''
+            rows = agent_panel_rows(overview, args.width, args.tmux, label + ' · ' + metrics if metrics else '', timing)
             if args.agent_row == 0 and args.tmux and args.run:
                 update_agent_height(args.run, len(rows), home)
             print(rows[args.agent_row] if 0 <= args.agent_row < len(rows) else '#[bg=colour236]' if args.tmux else '')
