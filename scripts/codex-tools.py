@@ -391,6 +391,38 @@ def display_title(session, fallback=None):
     return (title[:87] + '…') if len(title) > 88 else title
 
 
+def session_message_times(sessions):
+    """Read message timestamps only; tool activity and renames do not count."""
+    ids = sorted({session['session_id'] for session in sessions})
+    database = pathlib.Path(os.environ.get('CODEX_HOME', str(pathlib.Path.home() / '.codex'))) / 'thread_history_1.sqlite'
+    times = {}
+    if not ids or not database.is_file():
+        return times
+    try:
+        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=0.5) as connection:
+            for offset in range(0, len(ids), 500):
+                batch = ids[offset:offset + 500]
+                rows = connection.execute(
+                    'SELECT thread_id, MAX(created_at_ms) FROM thread_items '
+                    'WHERE thread_id IN (' + ','.join('?' for _ in batch) + ') '
+                    "AND item_type IN ('userMessage', 'agentMessage') GROUP BY thread_id", batch)
+                for native, at in rows:
+                    if isinstance(at, int) and at > 0:
+                        times[native] = at
+    except (OSError, ValueError, sqlite3.Error):
+        pass
+    return times
+
+
+def message_time_label(at):
+    try:
+        if at:
+            return datetime.datetime.fromtimestamp(at / 1000).astimezone().strftime('%d.%m.%Y %H:%M')
+    except (ValueError, OverflowError, OSError):
+        pass
+    return 'дата неизвестна'
+
+
 def selected_resume_arguments(arguments, native):
     selected = [argument for argument in arguments if argument not in ('--last', '--all')]
     index = selected.index('resume')
@@ -486,6 +518,8 @@ def reuse_resume(tmux, arguments, cwd):
                        if session['session_id'] not in live_ids)
         if not entries:
             return None
+        message_times = session_message_times(entries)
+        entries.sort(key=lambda entry: message_times.get(entry['session_id'], 0), reverse=True)
         names = run_titles(runs)
         saved_by_id = {session['session_id']: session for session in saved}
         print('Разговоры всех проектов:' if request['all'] else 'Разговоры текущего проекта:')
@@ -497,7 +531,8 @@ def reuse_resume(tmux, arguments, cwd):
             details = saved_by_id.get(entry['session_id'], entry)
             title = display_title(details, names.get(entry['session_id']))
             project = project_directory(entry['cwd'])
-            print(f'{index}. {title} — {project} — {state}')
+            sent = message_time_label(message_times.get(entry['session_id']))
+            print(f'{index}. {title} — последнее сообщение: {sent} — {project} — {state}')
         print('0. Отмена')
         while True:
             try:

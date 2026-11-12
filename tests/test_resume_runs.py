@@ -205,6 +205,42 @@ class ResumeRunsTests(unittest.TestCase):
         self.assertIn('Моё точное имя', output)
         self.assertNotIn('Первый вопрос', output)
 
+    def test_resume_sorts_live_and_saved_by_messages_and_selects_displayed_id(self):
+        self.write_saved(name='Свежий сохранённый')
+        self.write_saved(session=SESSION, name='Работающий старый')
+        with sqlite3.connect(self.home / '.codex/thread_history_1.sqlite') as db:
+            db.execute('CREATE TABLE thread_items (thread_id TEXT, item_type TEXT, created_at_ms INTEGER)')
+            db.executemany('INSERT INTO thread_items VALUES (?,?,?)', [
+                (SESSION,'userMessage',1000), (SESSION,'agentMessage',2000),
+                (SESSION,'commandExecution',9000), (SAVED,'userMessage',3000)])
+        output = Terminal()
+        with patch.object(Path, 'home', return_value=self.home), patch.object(self.module.subprocess, 'run', side_effect=self.command), patch.object(sys, 'stdin', Terminal('1\n')), contextlib.redirect_stdout(output):
+            selected = self.module.reuse_resume('/fixture/tmux', ['resume'], str(self.home))
+        self.assertEqual(selected, ('native', ['resume', SAVED]))
+        lines = output.getvalue().splitlines()
+        self.assertTrue(next(line for line in lines if line.startswith('1.')).startswith('1. Свежий сохранённый — последнее сообщение: '))
+        self.assertIn('2. Работающий старый — последнее сообщение: ', output.getvalue())
+        self.assertRegex(output.getvalue(), r'последнее сообщение: \d{2}\.\d{2}\.\d{4} \d{2}:\d{2}')
+
+    def test_message_times_refresh_and_do_not_read_message_contents(self):
+        self.write_saved()
+        database = self.home / '.codex/thread_history_1.sqlite'
+        with sqlite3.connect(database) as db:
+            # Only metadata is needed; there is no message body column.
+            db.execute('CREATE TABLE thread_items (thread_id TEXT, item_type TEXT, created_at_ms INTEGER)')
+            db.execute('INSERT INTO thread_items VALUES (?,?,?)', (SAVED,'userMessage',1000))
+        with patch.object(Path, 'home', return_value=self.home):
+            self.assertEqual(self.module.session_message_times([{'session_id':SAVED}]), {SAVED:1000})
+            with sqlite3.connect(database) as db:
+                db.execute('INSERT INTO thread_items VALUES (?,?,?)', (SAVED,'agentMessage',2000))
+            self.assertEqual(self.module.session_message_times([{'session_id':SAVED}]), {SAVED:2000})
+
+    def test_missing_message_history_is_explicit_and_picker_still_works(self):
+        self.write_saved()
+        result, output = self.invoke(['resume'], '0\n')
+        self.assertEqual(result, 0)
+        self.assertIn('последнее сообщение: дата неизвестна', output)
+
     def test_saved_without_name_uses_title_then_generic_label(self):
         self.write_saved(name='', title='Осмысленный заголовок')
         with patch.object(Path, 'home', return_value=self.home):
