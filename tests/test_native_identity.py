@@ -30,6 +30,8 @@ for line in sys.stdin:
         time.sleep(30)
     if mode == 'error' and method == 'thread/name/set':
         result = {'id': message['id'], 'error': {'code': -32600, 'message': 'fixture'}}
+    elif method == 'config/read':
+        result = {'id': message['id'], 'result': {'config': {'model_reasoning_effort': os.environ.get('FAKE_EFFORT', 'medium')}}}
     elif method == 'thread/start':
         print(json.dumps({'method': 'thread/started', 'params': {}}), flush=True)
         result = {'id': message['id'], 'result': {'thread': {'id': os.environ['FAKE_ID']}}}
@@ -71,10 +73,13 @@ class NativeThreadTests(unittest.TestCase):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def test_app_server_creates_a_persisted_named_thread_without_a_model_turn(self):
-        self.assertEqual(self.create(), NATIVE)
+        native = self.create()
+        self.assertEqual(native, NATIVE)
+        self.assertEqual(native.reasoning_effort, 'medium')
         methods = [request['method'] for request in self.requests()]
-        self.assertEqual(methods, ['initialize', 'initialized', 'thread/start', 'thread/name/set'])
-        start, name = self.requests()[2]['params'], self.requests()[3]['params']
+        self.assertEqual(methods, ['initialize', 'initialized', 'config/read', 'thread/start', 'thread/name/set'])
+        self.assertEqual(self.requests()[2]['params'], {'cwd': str(self.root), 'includeLayers': False})
+        start, name = self.requests()[3]['params'], self.requests()[4]['params']
         self.assertEqual(start, {'cwd': str(self.root), 'sessionStartSource': 'startup'})
         # An unnamed thread is never written to disk, so Codex could not resume it.
         self.assertEqual(name, {'threadId': NATIVE, 'name': 'empirika 10-28 10:16'})
@@ -96,6 +101,15 @@ class StartupIdentityTests(unittest.TestCase):
                 patch.object(self.launcher.subprocess, 'run', return_value=context), \
                 patch.object(self.launcher, 'create_native_thread', return_value=native) as create:
             return self.launcher.startup_arguments(args, str(cwd), '/fixture/codex'), create
+
+    def test_prepared_resume_explicitly_inherits_effective_reasoning_effort(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            for effort in ('medium', 'high'):
+                prepared = self.launcher.PreparedThread(NATIVE, effort)
+                (args, native), _ = self.invoke([], root, prepared)
+                self.assertEqual(args, ['resume', '-c', 'model_reasoning_effort="' + effort + '"', NATIVE])
+                self.assertEqual(native, NATIVE)
 
     def test_connected_empty_launch_resumes_a_prepared_thread(self):
         with tempfile.TemporaryDirectory() as d:

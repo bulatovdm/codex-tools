@@ -23,6 +23,13 @@ WORK_WORKER_STARTUP_PROMPT = (
 )
 
 
+class PreparedThread(str):
+    def __new__(cls, native, effort=None):
+        value = super().__new__(cls, native)
+        value.reasoning_effort = effort
+        return value
+
+
 def create_native_thread(cli, cwd, name, timeout=10):
     """Ask Codex for a new thread without a model turn; None keeps the old path.
 
@@ -55,13 +62,17 @@ def create_native_thread(cli, cwd, name, timeout=10):
             return None
         process.stdin.write(json.dumps({'jsonrpc': '2.0', 'method': 'initialized'}) + '\n')
         process.stdin.flush()
-        started = call(2, 'thread/start', {'cwd': cwd, 'sessionStartSource': 'startup'})
+        configured = call(2, 'config/read', {'cwd': cwd, 'includeLayers': False})
+        effort = ((configured or {}).get('config') or {}).get('model_reasoning_effort')
+        if effort not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
+            effort = None
+        started = call(3, 'thread/start', {'cwd': cwd, 'sessionStartSource': 'startup'})
         native = ((started or {}).get('thread') or {}).get('id')
         if not isinstance(native, str) or str(uuid.UUID(native)) != native.lower():
             return None
-        if call(3, 'thread/name/set', {'threadId': native, 'name': name}) is None:
+        if call(4, 'thread/name/set', {'threadId': native, 'name': name}) is None:
             return None
-        return native.lower()
+        return PreparedThread(native.lower(), effort)
     except (OSError, ValueError, TypeError, AttributeError):
         return None
     finally:
@@ -69,6 +80,8 @@ def create_native_thread(cli, cwd, name, timeout=10):
             timer.cancel()
         process.kill()
         process.wait()
+        process.stdin.close()
+        process.stdout.close()
 
 
 def startup_arguments(arguments, cwd, cli=None):
@@ -125,7 +138,11 @@ def _startup_arguments(arguments, cwd, cli=None):
     name = root.name + ' ' + datetime.datetime.now().strftime('%m-%d %H:%M')
     native = create_native_thread(cli or str(pathlib.Path.home() / '.local/bin/codex'), str(selected), name, 10)
     if native:
-        return ['resume', *arguments, native], native
+        effort = getattr(native, 'reasoning_effort', None)
+        # An empty prepared thread has no saved effort. Resume otherwise treats
+        # that null as "default", instead of inheriting the configured value.
+        overrides = ['-c', 'model_reasoning_effort=' + json.dumps(effort)] if effort else []
+        return ['resume', *arguments, *overrides, native], native
     return [*arguments, '--', WORK_WORKER_STARTUP_PROMPT], None
 
 
