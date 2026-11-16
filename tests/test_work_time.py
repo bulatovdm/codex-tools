@@ -44,7 +44,23 @@ class WorkTimeTests(unittest.TestCase):
 
     def test_old_unfinished_turn_does_not_advance_after_resume(self):
         self.assertEqual(self.read(live_since=500)['total_seconds'], 220)
-        self.assertIn('сейчас: пауза', status.work_time_label(self.read(live_since=500)))
+        self.assertIn('ход: пауза', status.work_time_label(self.read(live_since=500)))
+
+    def test_run_time_retains_previous_turn_and_excludes_idle_between_turns(self):
+        with sqlite3.connect(self.directory / 'thread_history_1.sqlite') as db:
+            db.execute('INSERT INTO thread_turns VALUES (?,?,?,?,?)', (ROOT,'inProgress',600,None,None))
+        # Resume at 290: 60s completed + 10s interrupted + 60s current.
+        # A superseded unfinished turn must not grow either.
+        value = self.read(live_since=290)
+        self.assertEqual(value['run_seconds'], 130)
+        self.assertEqual(value['current_seconds'], 60)
+        self.assertIn('за запуск: 2м', status.work_time_label(value))
+        with sqlite3.connect(self.directory / 'thread_history_1.sqlite') as db:
+            db.execute("UPDATE thread_turns SET status='completed', completed_at=660, duration_ms=60000 WHERE started_at=600")
+        paused = status.session_work_time(ROOT, {}, self.home, live_since=290, now=900)
+        self.assertEqual(paused['run_seconds'], 130)
+        self.assertIsNone(paused['current_seconds'])
+        self.assertIn('за запуск: 2м · ход: пауза', status.work_time_label(paused))
 
     def test_live_turns_advance_once_and_reset_survives_next_read(self):
         with sqlite3.connect(self.directory / 'thread_history_1.sqlite') as db:

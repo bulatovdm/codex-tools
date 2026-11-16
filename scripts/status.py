@@ -271,6 +271,7 @@ def session_work_time(session, environment, home, live_since=None, reset_task=Fa
         except (OSError, ValueError, AttributeError):
             pass
         return {'session_id': root, 'total_seconds': merged_seconds(intervals), 'live': live_since is not None,
+                'run_seconds': merged_seconds(intervals, live_since) if live_since is not None else None,
                 'current_seconds': max(0, now - min(ongoing)) if ongoing else None,
                 'task_seconds': merged_seconds(intervals, since) if isinstance(since, (int, float)) else None}
     except (OSError, ValueError, TypeError, sqlite3.Error):
@@ -281,7 +282,8 @@ def work_time_label(value):
     parts = ['Работа: ' + work_duration(value['total_seconds'])]
     if value['task_seconds'] is not None: parts.append('задача: ' + work_duration(value['task_seconds']))
     if value['live']:
-        parts.append('сейчас: ' + work_duration(value['current_seconds']) if value['current_seconds'] is not None else 'сейчас: пауза')
+        parts.append('за запуск: ' + work_duration(value['run_seconds']))
+        parts.append('ход: ' + work_duration(value['current_seconds']) if value['current_seconds'] is not None else 'ход: пауза')
     return ' · '.join(parts)
 
 def session_metrics(session, environment, home, run=None):
