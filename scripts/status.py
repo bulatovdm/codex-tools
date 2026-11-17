@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -216,14 +217,12 @@ def work_duration(seconds):
     hours, minutes = divmod(minutes, 60)
     return (str(hours) + 'ч ' if hours else '') + str(minutes) + 'м'
 
-def session_work_time(session, environment, home, live_since=None, reset_task=False, now=None):
-    """Union of recorded turn intervals, including descendants, without idle gaps."""
-    now = time.time() if now is None else now
-    directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
+def session_family(session, directory):
     if not session:
         return None
     try:
-        with sqlite3.connect((directory / 'state_5.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2) as db:
+        with contextlib.closing(sqlite3.connect(
+                (directory / 'state_5.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2)) as db:
             root = session
             seen = set()
             while root not in seen:
@@ -239,6 +238,19 @@ def session_work_time(session, environment, home, live_since=None, reset_task=Fa
                 SELECT ? UNION SELECT e.child_thread_id FROM thread_spawn_edges e JOIN family f ON e.parent_thread_id=f.id
             ) SELECT t.id, t.rollout_path, COALESCE(e.status, 'open') FROM family f
               JOIN threads t ON t.id=f.id LEFT JOIN thread_spawn_edges e ON e.child_thread_id=t.id''', (root,)).fetchall()
+        return root, members
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        return None
+
+def session_work_time(session, environment, home, live_since=None, reset_task=False, now=None, family=None):
+    """Union of recorded turn intervals, including descendants, without idle gaps."""
+    now = time.time() if now is None else now
+    directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
+    family = family if family is not None else session_family(session, directory)
+    if family is None:
+        return None
+    root, members = family
+    try:
         intervals, ongoing = [], []
         with sqlite3.connect((directory / 'thread_history_1.sqlite').as_uri() + '?mode=ro', uri=True, timeout=0.2) as history:
             for native, rollout, edge in members:
@@ -285,6 +297,36 @@ def work_time_label(value):
         parts.append('за запуск: ' + work_duration(value['run_seconds']))
         parts.append('ход: ' + work_duration(value['current_seconds']) if value['current_seconds'] is not None else 'ход: пауза')
     return ' · '.join(parts)
+
+def compact_tokens(count):
+    for threshold, suffix in ((1_000_000_000, 'B'), (1_000_000, 'M'), (1000, 'K')):
+        if count >= threshold:
+            return f'{count / threshold:.1f}'.rstrip('0').rstrip('.').replace('.', ',') + suffix
+    return str(count)
+
+def usage_label(value, compact=False):
+    if value is None:
+        return 'Токены: нет данных'
+    if value.get('pending'):
+        return 'Токены: читаю историю…'
+    total = value['total_tokens']
+    tokens = compact_tokens(total) if compact else f'{total:,}'.replace(',', ' ')
+    if value['missing_rollouts']:
+        tokens = '≥' + tokens
+    if not compact:
+        groups = (('вход', 'input_tokens'), ('из кеша', 'cached_input_tokens'), ('выход', 'output_tokens'))
+        details = (label + ' ' + f'{value[key]:,}'.replace(',', ' ') for label, key in groups)
+        tokens += ' (' + ', '.join(details) + ')'
+    speed = value['output_tokens_per_work_second']
+    rate = f'{speed:.1f}'.replace('.', ',') + ' ток/с' if speed is not None else '—'
+    usd = value['api_standard_usd']
+    if usd is None:
+        cost = 'API Std —'
+    else:
+        cost = 'API Std < $0.01' if 0 < usd < .01 else f'API Std ≈ ${usd:,.2f}'
+    if usd is not None and (value['missing_rollouts'] or value['api_priced_tokens'] < total):
+        cost += ' (часть)'
+    return f'Токены: {tokens} · темп сессии: {rate} · {cost}'
 
 def session_metrics(session, environment, home, run=None):
     """Use only persisted token metadata; never infer current quota after a reset."""
@@ -400,7 +442,7 @@ def agent_rows(overview, width, tmux=False, max_rows=4):
         rendered.append(result)
     return rendered
 
-def agent_panel_rows(overview, width, tmux=False, metrics="", timing=""):
+def agent_panel_rows(overview, width, tmux=False, metrics="", timing="", usage=""):
     """One compact agent row, padding around the group, and a shared info row."""
     width = max(16, min(width, 1000))
     def clip(text, limit):
@@ -445,6 +487,7 @@ def agent_panel_rows(overview, width, tmux=False, metrics="", timing=""):
                   'bg=colour236,fg=colour250,nobold')
         return '#[' + colors + ']' + text.replace('#', '##')
     blank = styled(' ' * width, False)
+    summary = styled(clip('  ' + usage, width), False) if usage else blank
     line = styled('  ', False) + ''.join(styled(text, style) for text, style in shown)
     line += styled(' ' * max(2, width - 2 - used), False)
     data = clean(metrics)
@@ -460,7 +503,7 @@ def agent_panel_rows(overview, width, tmux=False, metrics="", timing=""):
     if tmux: info = '#[bg=colour234,fg=colour248,nobold]' + info.replace('#', '##')
     clock = clip('  ' + timing, width) if timing else ''
     if tmux and clock: clock = '#[bg=colour236,fg=colour229,bold]' + clock.replace('#', '##') + '#[nobold]'
-    return [blank, line, clock or blank, info]
+    return [summary, line, clock or blank, info]
 
 def footer_thread_id(text):
     # Native footer may put thread-id last and truncate it to the available width.
@@ -582,10 +625,12 @@ def main():
     parser.add_argument('--width', type=int, default=120)
     parser.add_argument('--work-time', action='store_true')
     parser.add_argument('--reset-task', action='store_true')
+    parser.add_argument('--usage', action='store_true', help='токены, средний темп и оценка стоимости сессии')
     args = parser.parse_args()
     home = pathlib.Path.home()
     environment = dict(os.environ)
     live_since = None
+    panel_usage = args.agents and args.agent_row == 0
     if args.run:
         args.session = ''
         if not re.fullmatch(r'[a-f0-9]{32}', args.run):
@@ -593,7 +638,7 @@ def main():
         state = home / '.local/share/codex-tools/runs' / args.run
         launch = json.loads((state / 'launch.json').read_text())
         live_since = (state / 'launch.json').stat().st_mtime
-        if args.work_time or (args.agents and args.agent_row == 2):
+        if args.work_time or args.usage or panel_usage or (args.agents and args.agent_row == 2):
             installed_tmux = home / '.local/share/codex-tools/tmux/bin/tmux'
             tmux = str(installed_tmux) if installed_tmux.is_file() else shutil.which('tmux')
             try:
@@ -618,6 +663,30 @@ def main():
         return
     if args.reset_task:
         raise ValueError('--reset-task requires --work-time')
+    if args.usage or panel_usage:
+        from session_usage import session_token_usage
+
+        directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
+        family = session_family(args.session, directory)
+        budget = None if args.usage else 0.9
+        value = session_token_usage(family[1], directory, home, budget=budget) if family else None
+        if value is not None and not value.get('pending'):
+            work = session_work_time(args.session, environment, home, live_since, family=family)
+            seconds = work['total_seconds'] if work else 0
+            speed = value['output_tokens'] / seconds if seconds > 0 and not value['missing_rollouts'] else None
+            value.update(
+                session_id=family[0], work_seconds=seconds if work else None,
+                output_tokens_per_work_second=speed,
+            )
+        if args.usage:
+            print(json.dumps(value, ensure_ascii=False) if args.json else usage_label(value))
+        else:
+            label = usage_label(value, compact=True) if args.session else ''
+            rows = agent_panel_rows('', args.width, args.tmux, usage=label)
+            if args.tmux and args.run:
+                update_agent_height(args.run, len(rows), home)
+            print(rows[0])
+        return
     if args.agents:
         if args.agent_row is not None:
             selected = visible_agent(args.run, home) if args.run else None
@@ -628,8 +697,6 @@ def main():
             label = ' Выбранный' if chosen else ' Основной'
             timing = work_time_label(session_work_time(args.session, environment, home, live_since)) if args.agent_row == 2 else ''
             rows = agent_panel_rows(overview, args.width, args.tmux, label + ' · ' + metrics if metrics else '', timing)
-            if args.agent_row == 0 and args.tmux and args.run:
-                update_agent_height(args.run, len(rows), home)
             print(rows[args.agent_row] if 0 <= args.agent_row < len(rows) else '#[bg=colour236]' if args.tmux else '')
         else:
             text = clean(agent_overview(args.session, environment, home))
