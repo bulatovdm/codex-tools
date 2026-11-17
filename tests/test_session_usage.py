@@ -76,6 +76,7 @@ class SessionUsageTests(unittest.TestCase):
         self.assertAlmostEqual(report['api_standard_usd'], .0067 + 1.024 + .0032)
         self.assertAlmostEqual(report['output_tokens_per_work_second'], 700 / 30)
         row = self.status('--session', ROOT, '--agents', '--agent-row', '0', '--width', '100')
+        self.assertIn('Токены: 307,7K (вход 307K, из кэша 254K, выход 700)', row)
         self.assertIn('темп сессии: 23,3 ток/с', row)
         self.assertIn('API Std ≈ $1.03', row)
 

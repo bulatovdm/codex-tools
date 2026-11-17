@@ -310,13 +310,15 @@ def usage_label(value, compact=False):
     if value.get('pending'):
         return 'Токены: читаю историю…'
     total = value['total_tokens']
-    tokens = compact_tokens(total) if compact else f'{total:,}'.replace(',', ' ')
+    def format_count(count):
+        return compact_tokens(count) if compact else f'{count:,}'.replace(',', ' ')
+
+    tokens = format_count(total)
     if value['missing_rollouts']:
         tokens = '≥' + tokens
-    if not compact:
-        groups = (('вход', 'input_tokens'), ('из кеша', 'cached_input_tokens'), ('выход', 'output_tokens'))
-        details = (label + ' ' + f'{value[key]:,}'.replace(',', ' ') for label, key in groups)
-        tokens += ' (' + ', '.join(details) + ')'
+    groups = (('вход', 'input_tokens'), ('из кэша', 'cached_input_tokens'), ('выход', 'output_tokens'))
+    details = (f'{label} {format_count(value[key])}' for label, key in groups)
+    tokens += ' (' + ', '.join(details) + ')'
     speed = value['output_tokens_per_work_second']
     rate = f'{speed:.1f}'.replace('.', ',') + ' ток/с' if speed is not None else '—'
     usd = value['api_standard_usd']
