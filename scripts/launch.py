@@ -15,6 +15,27 @@ while not (directory / 'ready').exists():
     if time.monotonic() > deadline:
         sys.exit('codex-tools: terminal setup did not finish')
     time.sleep(0.05)
+# A detached tmux pane has no outer terminal palette. Let the first client
+# attach before Codex runs its one-time light/dark background probe.
+if os.environ.get('TMUX') and sys.stdin.isatty():
+    installed_tmux = pathlib.Path.home() / '.local/share/codex-tools/tmux/bin/tmux'
+    tmux = str(installed_tmux) if installed_tmux.is_file() else shutil.which('tmux')
+    if tmux:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            try:
+                attached = subprocess.run(
+                    [tmux, 'display-message', '-p', '#{session_attached}'],
+                    capture_output=True, text=True, timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                break
+            if attached.returncode != 0:
+                break
+            if attached.stdout.strip().isdigit() and int(attached.stdout.strip()) > 0:
+                # Allow tmux's initial OSC 10/11 exchange to finish.
+                time.sleep(0.3)
+                break
+            time.sleep(0.05)
 os.environ['CODEX_TOOLS_RUN'] = directory.name
 # The tmux shell may source ~/.zshenv; restore the terminal's exact runtime choice.
 os.environ.pop('WORK_WORKER_HOME', None)
