@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+from datetime import datetime
 
 
 TOKEN_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens')
@@ -21,10 +22,11 @@ STANDARD_RATES = {
     'gpt-6-sol': (2, .20, 2.50, 10),
     'gpt-6-luna': (.10, .01, .125, .50),
 }
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 MAX_LINE_BYTES = 1024 * 1024
-METADATA = re.compile(rb'"(?:session_meta|turn_context|token_count)"')
+METADATA = re.compile(rb'"(?:session_meta|turn_context|token_count|thread_settings_applied|task_started|task_complete|turn_aborted|task_failed)"')
 ZERO = (0, 0, 0, 0)
+TIERS = {'default': 'Standard', 'priority': 'Fast', 'ultrafast': 'Ultrafast'}
 
 
 def read_counts(value):
@@ -36,6 +38,43 @@ def read_counts(value):
 
 def add_counts(left, right):
     return [a + b for a, b in zip(left, right)]
+
+
+def event_time(event):
+    try:
+        return datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).timestamp()
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def record_pace_boundary(state, event, payload):
+    kind = payload.get('type')
+    turn = state['turn']
+    if kind == 'thread_settings_applied':
+        settings = payload.get('thread_settings')
+        tier = settings.get('service_tier') if isinstance(settings, dict) else None
+        if isinstance(tier, str) and tier != state['tier']:
+            state['tier'] = tier
+            if turn and turn['completed_at'] is None:
+                # A request already in flight can finish after a tier switch.
+                # Its first new count establishes a baseline for this tier.
+                turn.update(since=None, output_tokens=0)
+            else:
+                state['turn'] = None
+    elif kind == 'task_started':
+        at = event_time(event)
+        turn_id = payload.get('turn_id')
+        state['turn'] = (
+            {'id': turn_id, 'started_at': at, 'since': at, 'output_tokens': 0, 'completed_at': None}
+            if at is not None and isinstance(turn_id, str) else None
+        )
+    elif turn and turn['id'] == payload.get('turn_id'):
+        if kind == 'task_complete':
+            turn['completed_at'] = event_time(event)
+            if turn['completed_at'] is None:
+                state['turn'] = None
+        elif kind in ('turn_aborted', 'task_failed'):
+            state['turn'] = None
 
 
 def record_usage(state, raw):
@@ -57,7 +96,10 @@ def record_usage(state, raw):
         model = payload.get('model')
         state['model'] = model if isinstance(model, str) and len(model) <= 128 else ''
         return
-    if event.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+    if event.get('type') != 'event_msg':
+        return
+    if payload.get('type') != 'token_count':
+        record_pace_boundary(state, event, payload)
         return
     info = payload.get('info')
     if not isinstance(info, dict):
@@ -81,6 +123,12 @@ def record_usage(state, raw):
     if not any(delta):
         return
     state['counts'] = add_counts(state['counts'], delta)
+    turn = state['turn']
+    if turn and turn['completed_at'] is None and last == delta:
+        if turn['since'] is None:
+            turn['since'] = event_time(event)
+        else:
+            turn['output_tokens'] += delta[3]
     if state['openai'] and last == delta and delta[1] + delta[2] <= delta[0]:
         length = 'long' if delta[0] > 272_000 else 'short'
         bucket = state['model'] + ':' + length
@@ -141,7 +189,7 @@ def scan_rollout(path, cache, deadline):
             state = {
                 'version': CACHE_VERSION, 'identity': identity, 'offset': 0,
                 'previous': None, 'counts': ZERO, 'priced': {}, 'openai': False,
-                'model': '', 'forked_at': None, 'skip_line': False,
+                'model': '', 'forked_at': None, 'skip_line': False, 'tier': None, 'turn': None,
             }
         start = offset = state['offset']
         source.seek(offset)
@@ -180,7 +228,23 @@ def estimate_usd(bucket, counts):
     return sum(count * rate for count, rate in zip(billable, rates)) / 1_000_000
 
 
-def session_token_usage(members, directory, home, budget=None):
+def turn_pace(data, live_since, now):
+    tier = TIERS.get(data['tier'])
+    turn = data['turn']
+    if turn is None:
+        return {'tier': tier, 'state': 'idle', 'output_tokens_per_second': None}
+    end = turn['completed_at']
+    if end is None and (live_since is None or turn['started_at'] < live_since):
+        return {'tier': tier, 'state': 'idle', 'output_tokens_per_second': None}
+    seconds = (end if end is not None else now) - turn['since'] if turn['since'] is not None else 0
+    speed = turn['output_tokens'] / seconds if seconds > 0 and turn['output_tokens'] else None
+    return {
+        'tier': tier, 'state': 'completed' if end is not None else 'running',
+        'output_tokens_per_second': speed,
+    }
+
+
+def session_token_usage(members, directory, home, budget=None, *, pace_thread=None, live_since=None):
     """Aggregate the main thread and descendants, each rollout counted once."""
     scope = hashlib.sha256(os.fsencode(directory.resolve())).hexdigest()[:24]
     cache_dir = home / '.cache/codex-tools/session-usage' / scope
@@ -189,7 +253,8 @@ def session_token_usage(members, directory, home, budget=None):
     usd = 0.0
     priced_tokens = 0
     missing_rollouts = 0
-    for native, rollout, _ in members:
+    pace = None
+    for native, rollout, edge in members:
         if not isinstance(rollout, str) or not rollout or not re.fullmatch(r'[a-f0-9-]{36}', native):
             missing_rollouts += 1
             continue
@@ -201,6 +266,8 @@ def session_token_usage(members, directory, home, budget=None):
         if pending:
             return {'pending': True}
         counts = add_counts(counts, data['counts'])
+        if native == pace_thread:
+            pace = turn_pace(data, live_since if edge != 'closed' else None, time.time())
         for bucket, tokens in data['priced'].items():
             cost = estimate_usd(bucket, tokens)
             if cost is not None:
@@ -215,4 +282,5 @@ def session_token_usage(members, directory, home, budget=None):
         'api_standard_usd': round(usd, 8) if priced_tokens else None,
         'api_priced_tokens': priced_tokens,
         'missing_rollouts': missing_rollouts,
+        'turn_pace': pace,
     }

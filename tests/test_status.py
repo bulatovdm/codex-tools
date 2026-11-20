@@ -231,18 +231,26 @@ class StatusTests(unittest.TestCase):
     def test_metrics_use_exact_thread_and_actual_quota_window(self):
         directory = self.root / '.codex'; directory.mkdir()
         rollout = directory / 'thread.jsonl'
+        now = 2_000_000
         event = {'type':'event_msg','payload':{'type':'token_count','info':{'last_token_usage':{'total_tokens':95000},'model_context_window':475000},
-            'rate_limits':{'primary':{'window_minutes':10080,'used_percent':46,'resets_at':9999999999}}}}
+            'rate_limits':{'primary':{'window_minutes':10080,'used_percent':46,'resets_at':now + 3 * 86400 + 6 * 3600},
+                           'secondary':{'window_minutes':300,'used_percent':100,'resets_at':now + 5}}}}
         rollout.write_text(json.dumps(event)+'\n')
         with sqlite3.connect(directory / 'state_5.sqlite') as db:
             db.execute('CREATE TABLE threads (id TEXT, rollout_path TEXT, model TEXT, reasoning_effort TEXT)')
             db.execute('INSERT INTO threads VALUES (?,?,?,?)', ('ours',str(rollout),'gpt-6.1-sol','medium'))
-        value = status.session_metrics('ours', {}, self.root)
+        run = 'a' * 32
+        (self.root / '.local/share/codex-tools/runs' / run).mkdir(parents=True)
+        with mock.patch.object(status.time, 'time', return_value=now):
+            value = status.session_metrics('ours', {}, self.root, run)
         self.assertIn('95K / 475K', value)
         self.assertIn('gpt-6.1-sol medium', value)
         self.assertNotIn('снимок', value)
         self.assertNotIn('посл. данные', value)
-        self.assertIn('неделя: 54% осталось', value)
+        self.assertIn('неделя: осталось 54% ◑ 3д 6ч', value)
+        self.assertIn('5ч: осталось 0% ○ 1м', value)
+        with mock.patch.object(status.time, 'time', return_value=now + 5):
+            self.assertIn('5ч: ожидает данных', status.session_metrics('ours', {}, self.root, run))
         self.assertEqual(status.session_metrics('other', {}, self.root), '')
         event['payload']['rate_limits']['primary']['resets_at'] = 1
         rollout.write_text(json.dumps(event)+'\n')
@@ -250,7 +258,7 @@ class StatusTests(unittest.TestCase):
         rows = status.agent_panel_rows([('Основной: Main','main')], 120, metrics='Основной · '+value)
         self.assertLessEqual(len(rows),4)
         self.assertIn('475K', '\n'.join(rows))
-        self.assertIn('неделя:', '\n'.join(rows))
+        self.assertIn('неделя: осталось 54% ◑ 3д 6ч', '\n'.join(rows))
 
 
     def test_rename_is_read_on_each_refresh_for_exact_session(self):

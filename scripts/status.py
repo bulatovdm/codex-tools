@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import datetime
 import json
+import math
 import os
 import pathlib
 import re
@@ -304,6 +305,20 @@ def compact_tokens(count):
             return f'{count / threshold:.1f}'.rstrip('0').rstrip('.').replace('.', ',') + suffix
     return str(count)
 
+def pace_label(pace):
+    pace = pace or {}
+    mode = pace.get('tier')
+    state = pace.get('state')
+    speed = pace.get('output_tokens_per_second')
+    label = 'Прошлый ход' if state == 'completed' else 'Темп хода'
+    if speed is not None:
+        rate = f'{speed:.1f}'.replace('.', ',') + ' ток/с'
+    elif state == 'running':
+        rate = 'замер…'
+    else:
+        rate = '—'
+    return label + (f' ({mode})' if mode else '') + ': ' + rate
+
 def usage_label(value, compact=False):
     if value is None:
         return 'Токены: нет данных'
@@ -319,7 +334,7 @@ def usage_label(value, compact=False):
     groups = (('вход', 'input_tokens'), ('из кэша', 'cached_input_tokens'), ('выход', 'output_tokens'))
     details = (f'{label} {format_count(value[key])}' for label, key in groups)
     tokens += ' (' + ', '.join(details) + ')'
-    speed = value['output_tokens_per_work_second']
+    speed = value.get('output_tokens_per_work_second')
     rate = f'{speed:.1f}'.replace('.', ',') + ' ток/с' if speed is not None else '—'
     usd = value['api_standard_usd']
     if usd is None:
@@ -328,20 +343,55 @@ def usage_label(value, compact=False):
         cost = 'API Std < $0.01' if 0 < usd < .01 else f'API Std ≈ ${usd:,.2f}'
     if usd is not None and (value['missing_rollouts'] or value['api_priced_tokens'] < total):
         cost += ' (часть)'
+    if compact:
+        return f'{pace_label(value.get("turn_pace"))} · Токены: {tokens} · {cost}'
     return f'Токены: {tokens} · темп сессии: {rate} · {cost}'
+
+def quota_metrics(text, rates, now):
+    parts = [text] if text else []
+    for key in ('primary', 'secondary'):
+        rate = rates.get(key)
+        if not isinstance(rate, dict):
+            continue
+        used, minutes = rate.get('used_percent'), rate.get('window_minutes')
+        if not isinstance(used, (int, float)) or not isinstance(minutes, int) or minutes <= 0:
+            continue
+        label = {10080: 'неделя', 300: '5ч'}.get(minutes, f'{minutes}мин')
+        value = f'осталось {round(max(0, min(100, 100 - used)))}%'
+        reset = rate.get('resets_at')
+        if isinstance(reset, (int, float)) and math.isfinite(reset) and reset > 0:
+            left = reset - now
+            if left <= 0:
+                value = 'ожидает данных'
+            else:
+                fraction = left / (minutes * 60)
+                icon = next(symbol for threshold, symbol in (
+                    (.875, '●'), (.625, '◕'), (.375, '◑'), (.125, '◔'), (0, '○')
+                ) if fraction > threshold)
+                remaining = math.ceil(left / 60)
+                days, remainder = divmod(remaining, 1440)
+                if days:
+                    hours = remainder // 60
+                    duration = f'{days}д' + (f' {hours}ч' if hours else '')
+                else:
+                    duration = work_duration(remaining * 60)
+                value += f' {icon} {duration}'
+        parts.append(label + ': ' + value)
+    return ' · '.join(parts)
 
 def session_metrics(session, environment, home, run=None):
     """Use only persisted token metadata; never infer current quota after a reset."""
     cache = None
+    now = time.time()
     if run and re.fullmatch(r'[a-f0-9]{32}', run):
         cache = home / '.local/share/codex-tools/runs' / run / 'panel-metrics.json'
         try:
             saved = json.loads(cache.read_text())
-            if saved.get('format') == 3 and saved.get('session') == session and 0 <= time.time() - saved.get('at', 0) < 30:
-                return saved.get('text', '')
-        except (OSError, ValueError, TypeError):
+            if saved.get('format') == 4 and saved.get('session') == session and 0 <= now - saved.get('at', 0) < 30:
+                return quota_metrics(saved.get('text', ''), saved.get('rates', {}), now)
+        except (OSError, ValueError, TypeError, AttributeError):
             pass
-    text = ''
+    text, rates = '', {}
     directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
     connection = None
     try:
@@ -376,14 +426,7 @@ def session_metrics(session, environment, home, run=None):
             parts = [' '.join(value for value in (model, effort) if value)] if model or effort else []
             if isinstance(usage, (int, float)) and isinstance(window, (int, float)) and window > 0:
                 parts.append('контекст: ' + str(round(usage / 1000)) + 'K / ' + str(round(window / 1000)) + 'K')
-            for key in ('primary', 'secondary'):
-                rate = rates.get(key) or {}
-                used, minutes = rate.get('used_percent'), rate.get('window_minutes')
-                if not isinstance(used, (int, float)) or not isinstance(minutes, int): continue
-                label = 'неделя' if minutes == 10080 else '5ч' if minutes == 300 else str(minutes) + 'мин'
-                reset = rate.get('resets_at')
-                value = 'ожидает данных' if isinstance(reset, (int, float)) and reset <= time.time() else str(round(max(0, min(100, 100 - used)))) + '% осталось'
-                parts.append(label + ': ' + value)
+            rates = {key: rates[key] for key in ('primary', 'secondary') if key in rates}
             text = ' · '.join(parts) if parts else ''
     except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
         pass
@@ -392,12 +435,14 @@ def session_metrics(session, environment, home, run=None):
     if cache is not None:
         temporary = cache.with_name(cache.name + '.' + str(os.getpid()))
         try:
-            temporary.write_text(json.dumps({'format': 3, 'session': session, 'at': time.time(), 'text': text}, ensure_ascii=False))
+            temporary.write_text(json.dumps({
+                'format': 4, 'session': session, 'at': now, 'text': text, 'rates': rates,
+            }, ensure_ascii=False))
             temporary.chmod(0o600)
             os.replace(temporary, cache)
         except OSError:
             temporary.unlink(missing_ok=True)
-    return text
+    return quota_metrics(text, rates, now)
 
 def agent_rows(overview, width, tmux=False, max_rows=4):
     """Wrap whole entries where possible; keep trusted styles apart from names."""
@@ -498,9 +543,15 @@ def agent_panel_rows(overview, width, tmux=False, metrics="", timing="", usage="
         data = data.replace(old, new)
     who = ('Сейчас: ' + ('основной' if selected.startswith('Основной:') else clip(selected, 20))) if selected else 'Выбор: Codex'
     if not selected and data: who = ''
-    controls = ' /subagents · ⌥←/→ ' if width >= 100 else ' /subagents '
+    details = ' ' + ' · '.join(part for part in (who, data) if part)
+    controls = ' /subagents '
+    full_controls = ' /subagents · ⌥←/→ '
+    if width >= 100 and cell_width(details + full_controls) <= width:
+        controls = full_controls
+    elif data and cell_width(details + controls) > width:
+        controls = ''
     available = max(0, width - cell_width(controls))
-    info = clip(' ' + ' · '.join(part for part in (who, data) if part), available)
+    info = clip(details, available)
     info += ' ' * max(0, available - cell_width(info)) + clip(controls, width - cell_width(info))
     if tmux: info = '#[bg=colour234,fg=colour248,nobold]' + info.replace('#', '##')
     clock = clip('  ' + timing, width) if timing else ''
@@ -671,8 +722,15 @@ def main():
         directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
         family = session_family(args.session, directory)
         budget = None if args.usage else 0.9
-        value = session_token_usage(family[1], directory, home, budget=budget) if family else None
-        if value is not None and not value.get('pending'):
+        value = None
+        if family:
+            members = [native for native, _, _ in family[1]]
+            selected = resolve_visible_agent(visible_agent(args.run, home), members) if args.run and panel_usage else None
+            pace_thread = selected or resolve_visible_agent(args.session, members) or family[0]
+            value = session_token_usage(
+                family[1], directory, home, budget=budget, pace_thread=pace_thread, live_since=live_since,
+            )
+        if args.usage and value is not None and not value.get('pending'):
             work = session_work_time(args.session, environment, home, live_since, family=family)
             seconds = work['total_seconds'] if work else 0
             speed = value['output_tokens'] / seconds if seconds > 0 and not value['missing_rollouts'] else None

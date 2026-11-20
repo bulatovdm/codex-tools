@@ -5,7 +5,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
 
 
 SCRIPTS = pathlib.Path(__file__).parents[1] / 'scripts'
@@ -13,8 +15,11 @@ ROOT = '00000000-0000-0000-0000-000000000001'
 CHILD = '00000000-0000-0000-0000-000000000002'
 
 
-def event(kind, payload):
-    return json.dumps({'type': kind, 'payload': payload}) + '\n'
+def event(kind, payload, at=None):
+    record = {'type': kind, 'payload': payload}
+    if at is not None:
+        record['timestamp'] = datetime.fromtimestamp(at, timezone.utc).isoformat()
+    return json.dumps(record) + '\n'
 
 
 def metadata(model, fork=False):
@@ -25,12 +30,12 @@ def metadata(model, fork=False):
     }) + event('turn_context', {'model': model})
 
 
-def usage(last, total=None):
+def usage(last, total=None, at=None):
     fields = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens')
     return event('event_msg', {'type': 'token_count', 'info': {
         'last_token_usage': dict(zip(fields, last)),
         'total_token_usage': dict(zip(fields, total if total is not None else last)),
-    }})
+    }}, at)
 
 
 class SessionUsageTests(unittest.TestCase):
@@ -77,7 +82,7 @@ class SessionUsageTests(unittest.TestCase):
         self.assertAlmostEqual(report['output_tokens_per_work_second'], 700 / 30)
         row = self.status('--session', ROOT, '--agents', '--agent-row', '0', '--width', '100')
         self.assertIn('Токены: 307,7K (вход 307K, из кэша 254K, выход 700)', row)
-        self.assertIn('темп сессии: 23,3 ток/с', row)
+        self.assertIn('Темп хода: —', row)
         self.assertIn('API Std ≈ $1.03', row)
 
     def test_resume_skips_inherited_fork_totals_and_finishes_partial_append(self):
@@ -98,6 +103,58 @@ class SessionUsageTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report['total_tokens'], 11)
         self.assertIsNone(report['api_standard_usd'])
+
+    def test_pace_resets_on_switch_excludes_inflight_batch_and_freezes_at_completion(self):
+        now = int(time.time())
+        started = now - 120
+        run = 'a' * 32
+        installed = self.home / '.local/share/codex-tools'
+        state = installed / 'runs' / run
+        state.mkdir(parents=True)
+        launch = state / 'launch.json'
+        launch.write_text(json.dumps({'cwd': str(self.home), 'environment': {}}))
+        os.utime(launch, (started - 1, started - 1))
+        (state / 'session.json').write_text(json.dumps({'session_id': ROOT}))
+        tmux = installed / 'tmux/bin/tmux'
+        tmux.parent.mkdir(parents=True)
+        tmux.write_text('#!/bin/sh\ncase "$*" in *list-panes*) echo 0 ;; esac\n')
+        tmux.chmod(0o700)
+
+        def lifecycle(kind, seconds, **payload):
+            return event('event_msg', {'type': kind, **payload}, started + seconds)
+
+        def mode(tier, seconds):
+            return lifecycle('thread_settings_applied', seconds,
+                             thread_settings={'service_tier': tier})
+
+        def append(records):
+            with self.rollout.open('a') as output:
+                output.write(records)
+
+        old = (100, 0, 0, 600)
+        inflight = usage((100, 0, 0, 200), (300, 0, 0, 1000), started + 30)
+        self.rollout.write_text(metadata('gpt-6.2-sol') + usage(old)
+                                + mode('default', 0) + lifecycle('task_started', 0, turn_id='new')
+                                + usage((100, 0, 0, 200), (200, 0, 0, 800), started + 10)
+                                + mode('priority', 20)
+                                + inflight + inflight)
+        args = ('--run', run)
+        self.assertIn('Темп хода (Fast): замер…', self.status(*args, '--agents', '--agent-row', '0'))
+
+        append(mode('priority', 32)
+               + usage((100, 0, 0, 300), (400, 0, 0, 1300), started + 40)
+               + lifecycle('task_complete', 45, turn_id='new'))
+        report = self.report()
+        self.assertEqual(report['output_tokens'], 1300)
+        self.assertEqual(report['turn_pace'], {
+            'tier': 'Fast', 'state': 'completed', 'output_tokens_per_second': 20,
+        })
+        row = self.status(*args, '--agents', '--agent-row', '0')
+        self.assertIn('Прошлый ход (Fast): 20,0 ток/с', row)
+
+        append(mode('ultrafast', 60) + lifecycle('task_started', 65, turn_id='next'))
+        self.assertIn('Темп хода (Ultrafast): замер…', self.status(*args, '--agents', '--agent-row', '0'))
+        self.assertEqual(self.report()['turn_pace']['state'], 'idle')
 
 
 if __name__ == '__main__':
