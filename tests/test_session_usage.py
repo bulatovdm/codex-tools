@@ -147,14 +147,29 @@ class SessionUsageTests(unittest.TestCase):
         report = self.report()
         self.assertEqual(report['output_tokens'], 1300)
         self.assertEqual(report['turn_pace'], {
-            'tier': 'Fast', 'state': 'completed', 'output_tokens_per_second': 20,
+            'tier': 'Fast', 'state': 'completed', 'output_tokens_per_second': 30,
         })
         row = self.status(*args, '--agents', '--agent-row', '0')
-        self.assertIn('Прошлый ход (Fast): 20,0 ток/с', row)
+        self.assertIn('Прошлый ход (Fast): 30,0 ток/с с инструментами', row)
 
         append(mode('ultrafast', 60) + lifecycle('task_started', 65, turn_id='next'))
         self.assertIn('Темп хода (Ultrafast): замер…', self.status(*args, '--agents', '--agent-row', '0'))
         self.assertEqual(self.report()['turn_pace']['state'], 'idle')
+
+        # The response usage arrives before the tool finishes.
+        response = event('token_usage_record', {
+            'turn_id': 'next', 'turn_token_usage': {'input_tokens': 100, 'output_tokens': 500},
+        }, started + 75)
+        append(response)
+        row = self.status(*args, '--agents', '--agent-row', '0')
+        self.assertIn('Темп хода (Ultrafast): 50,0 ток/с с инструментами', row)
+        append(usage((100, 0, 0, 500), (500, 0, 0, 1800), started + 100)
+               + lifecycle('task_complete', 105, turn_id='next'))
+        report = self.report()
+        self.assertEqual(report['output_tokens'], 1800)
+        self.assertEqual(report['turn_pace'], {
+            'tier': 'Ultrafast', 'state': 'completed', 'output_tokens_per_second': 50,
+        })
 
 
 if __name__ == '__main__':

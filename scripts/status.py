@@ -312,7 +312,7 @@ def pace_label(pace):
     speed = pace.get('output_tokens_per_second')
     label = 'Прошлый ход' if state == 'completed' else 'Темп хода'
     if speed is not None:
-        rate = f'{speed:.1f}'.replace('.', ',') + ' ток/с'
+        rate = f'{speed:.1f}'.replace('.', ',') + ' ток/с с инструментами'
     elif state == 'running':
         rate = 'замер…'
     else:
@@ -385,13 +385,8 @@ def session_metrics(session, environment, home, run=None):
     now = time.time()
     if run and re.fullmatch(r'[a-f0-9]{32}', run):
         cache = home / '.local/share/codex-tools/runs' / run / 'panel-metrics.json'
-        try:
-            saved = json.loads(cache.read_text())
-            if saved.get('format') == 4 and saved.get('session') == session and 0 <= now - saved.get('at', 0) < 30:
-                return quota_metrics(saved.get('text', ''), saved.get('rates', {}), now)
-        except (OSError, ValueError, TypeError, AttributeError):
-            pass
     text, rates = '', {}
+    revision = None
     directory = pathlib.Path(environment.get('CODEX_HOME') or home / '.codex')
     connection = None
     try:
@@ -402,6 +397,15 @@ def session_metrics(session, environment, home, run=None):
         row = connection.execute('SELECT rollout_path, ' + model_column + ', ' + effort_column + ' FROM threads WHERE id = ?', (session,)).fetchone()
         if row:
             with pathlib.Path(row[0]).open('rb') as stream:
+                stat = os.fstat(stream.fileno())
+                revision = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, row[1], row[2]]
+                if cache is not None:
+                    try:
+                        saved = json.loads(cache.read_text())
+                        if saved.get('format') == 5 and saved.get('session') == session and saved.get('revision') == revision:
+                            return quota_metrics(saved.get('text', ''), saved.get('rates', {}), now)
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        pass
                 stream.seek(0, 2)
                 start = max(0, stream.tell() - 1_500_000)
                 stream.seek(start)
@@ -409,6 +413,8 @@ def session_metrics(session, environment, home, run=None):
                 lines = stream.readlines()
             info = rates = None
             for raw in reversed(lines):
+                if b'"token_count"' not in raw[:256]:
+                    continue
                 try: event = json.loads(raw)
                 except ValueError: continue
                 if not isinstance(event, dict): continue
@@ -432,11 +438,11 @@ def session_metrics(session, environment, home, run=None):
         pass
     finally:
         if connection is not None: connection.close()
-    if cache is not None:
+    if cache is not None and revision is not None:
         temporary = cache.with_name(cache.name + '.' + str(os.getpid()))
         try:
             temporary.write_text(json.dumps({
-                'format': 4, 'session': session, 'at': now, 'text': text, 'rates': rates,
+                'format': 5, 'session': session, 'revision': revision, 'text': text, 'rates': rates,
             }, ensure_ascii=False))
             temporary.chmod(0o600)
             os.replace(temporary, cache)

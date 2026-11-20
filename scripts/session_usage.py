@@ -22,9 +22,12 @@ STANDARD_RATES = {
     'gpt-6-sol': (2, .20, 2.50, 10),
     'gpt-6-luna': (.10, .01, .125, .50),
 }
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 MAX_LINE_BYTES = 1024 * 1024
-METADATA = re.compile(rb'"(?:session_meta|turn_context|token_count|thread_settings_applied|task_started|task_complete|turn_aborted|task_failed)"')
+METADATA = re.compile(
+    rb'"(?:session_meta|turn_context|token_count|token_usage_record|thread_settings_applied|'
+    rb'task_started|task_complete|turn_aborted|task_failed)"'
+)
 ZERO = (0, 0, 0, 0)
 TIERS = {'default': 'Standard', 'priority': 'Fast', 'ultrafast': 'Ultrafast'}
 
@@ -58,14 +61,17 @@ def record_pace_boundary(state, event, payload):
             if turn and turn['completed_at'] is None:
                 # A request already in flight can finish after a tier switch.
                 # Its first new count establishes a baseline for this tier.
-                turn.update(since=None, output_tokens=0)
+                turn.update(since=None, output_tokens=0, sample_at=None)
             else:
                 state['turn'] = None
     elif kind == 'task_started':
         at = event_time(event)
         turn_id = payload.get('turn_id')
         state['turn'] = (
-            {'id': turn_id, 'started_at': at, 'since': at, 'output_tokens': 0, 'completed_at': None}
+            {
+                'id': turn_id, 'started_at': at, 'since': at, 'output_tokens': 0,
+                'completed_at': None, 'sample_at': None, 'recorded_output': None, 'baseline': 0,
+            }
             if at is not None and isinstance(turn_id, str) else None
         )
     elif turn and turn['id'] == payload.get('turn_id'):
@@ -96,6 +102,20 @@ def record_usage(state, raw):
         model = payload.get('model')
         state['model'] = model if isinstance(model, str) and len(model) <= 128 else ''
         return
+    if event.get('type') == 'token_usage_record':
+        turn = state['turn']
+        if turn and turn['completed_at'] is None and turn['id'] == payload.get('turn_id'):
+            usage = read_counts(payload.get('turn_token_usage'))
+            at = event_time(event)
+            if usage is not None and at is not None:
+                output = usage[3]
+                previous = turn['recorded_output']
+                if previous is None or output > previous:
+                    turn['recorded_output'] = output
+                    if turn['since'] is None or (previous is None and turn['since'] != turn['started_at']):
+                        turn.update(since=at, baseline=output)
+                    turn.update(output_tokens=output - turn['baseline'], sample_at=at)
+        return
     if event.get('type') != 'event_msg':
         return
     if payload.get('type') != 'token_count':
@@ -124,11 +144,15 @@ def record_usage(state, raw):
         return
     state['counts'] = add_counts(state['counts'], delta)
     turn = state['turn']
-    if turn and turn['completed_at'] is None and last == delta:
-        if turn['since'] is None:
-            turn['since'] = event_time(event)
-        else:
-            turn['output_tokens'] += delta[3]
+    # Older Codex releases only persist token_count, after delivering tool outputs.
+    if turn and turn['completed_at'] is None and turn['recorded_output'] is None and last == delta:
+        at = event_time(event)
+        if at is not None and delta[3]:
+            if turn['since'] is None:
+                turn['since'] = at
+            else:
+                turn['output_tokens'] += delta[3]
+                turn['sample_at'] = at
     if state['openai'] and last == delta and delta[1] + delta[2] <= delta[0]:
         length = 'long' if delta[0] > 272_000 else 'short'
         bucket = state['model'] + ':' + length
@@ -228,7 +252,7 @@ def estimate_usd(bucket, counts):
     return sum(count * rate for count, rate in zip(billable, rates)) / 1_000_000
 
 
-def turn_pace(data, live_since, now):
+def turn_pace(data, live_since):
     tier = TIERS.get(data['tier'])
     turn = data['turn']
     if turn is None:
@@ -236,7 +260,7 @@ def turn_pace(data, live_since, now):
     end = turn['completed_at']
     if end is None and (live_since is None or turn['started_at'] < live_since):
         return {'tier': tier, 'state': 'idle', 'output_tokens_per_second': None}
-    seconds = (end if end is not None else now) - turn['since'] if turn['since'] is not None else 0
+    seconds = turn['sample_at'] - turn['since'] if turn['sample_at'] is not None else 0
     speed = turn['output_tokens'] / seconds if seconds > 0 and turn['output_tokens'] else None
     return {
         'tier': tier, 'state': 'completed' if end is not None else 'running',
@@ -267,7 +291,7 @@ def session_token_usage(members, directory, home, budget=None, *, pace_thread=No
             return {'pending': True}
         counts = add_counts(counts, data['counts'])
         if native == pace_thread:
-            pace = turn_pace(data, live_since if edge != 'closed' else None, time.time())
+            pace = turn_pace(data, live_since if edge != 'closed' else None)
         for bucket, tokens in data['priced'].items():
             cost = estimate_usd(bucket, tokens)
             if cost is not None:

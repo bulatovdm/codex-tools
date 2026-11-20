@@ -251,6 +251,14 @@ class StatusTests(unittest.TestCase):
         self.assertIn('5ч: осталось 0% ○ 1м', value)
         with mock.patch.object(status.time, 'time', return_value=now + 5):
             self.assertIn('5ч: ожидает данных', status.session_metrics('ours', {}, self.root, run))
+        event['payload']['info']['last_token_usage']['total_tokens'] = 110000
+        event['payload']['rate_limits']['primary']['used_percent'] = 0
+        with rollout.open('a') as stream:
+            stream.write(json.dumps(event) + '\n')
+        with mock.patch.object(status.time, 'time', return_value=now + 6):
+            fresh = status.session_metrics('ours', {}, self.root, run)
+        self.assertIn('110K / 475K', fresh)
+        self.assertIn('неделя: осталось 100%', fresh)
         self.assertEqual(status.session_metrics('other', {}, self.root), '')
         event['payload']['rate_limits']['primary']['resets_at'] = 1
         rollout.write_text(json.dumps(event)+'\n')
